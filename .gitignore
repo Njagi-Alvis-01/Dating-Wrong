@@ -1,0 +1,35 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+
+# Sensitive environment variables and secrets (Strictly excluded from GitHub)
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+!.env.example
+
+# Private cryptographic keys, certs, and tokens
+*.pem
+*.key
+*.cert
+*.crt
+*.token
+
+# Service accounts and credentials
+service-account*.json
+credentials*.json
+secrets*.json
+*secret*.json
+
+# Functions directory exclusions
+functions/node_modules/
+functions/lib/
+functions/.env*
+functions/service-account*.json
+functions/*.token
