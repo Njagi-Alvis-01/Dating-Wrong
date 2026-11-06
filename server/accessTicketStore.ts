@@ -7,8 +7,10 @@
  * 3. Only the SHA-256 hash of the token is persisted in Firestore (/accessTickets collection).
  * 4. Each token is strictly mapped to ONE designated email address.
  * 5. Consumed via atomic Firestore transaction to prevent replay attacks across distributed serverless instances.
- * 6. Unauthorized users attempting to use another person's URL or token are rejected.
- * 7. Expired tickets are rejected upon evaluation (no background timers required).
+ * 6. All reads executed before writes inside transactions.
+ * 7. Strictly fails closed on Firestore errors — zero in-memory fallback.
+ * 8. Unauthorized users attempting to use another person's URL or token are rejected.
+ * 9. Expired tickets are rejected upon evaluation (no background timers required).
  */
 
 import crypto from 'crypto';
@@ -32,9 +34,6 @@ export interface AccessTicket {
 }
 
 export class AccessTicketStore {
-  // In-memory token cache for local execution and fast lookup
-  private static ticketCache = new Map<string, AccessTicket>();
-
   /**
    * Generates a high-entropy 256-bit cryptographically secure token
    */
@@ -71,41 +70,28 @@ export class AccessTicketStore {
     const days = params.expiresInDays || 7;
     const expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
 
-    const ticket: AccessTicket = {
-      ticketId: token,
+    const ticketDoc = {
       ticketHash: tokenHash,
       type: 'customer_reader',
       targetEmail: cleanEmail,
       requestId: params.requestId,
-      transactionCode: params.transactionCode,
+      transactionCode: params.transactionCode || null,
       createdAt: now.toISOString(),
       expiresAt,
       isConsumed: false,
+      consumedAt: null,
+      consumedByEmail: null,
+      consumedByUid: null,
       singleUse: true,
     };
 
-    // Cache locally
-    this.ticketCache.set(tokenHash, ticket);
-
     // Persist SHA-256 hashed ticket in Firestore
     try {
-      await db.collection('accessTickets').doc(tokenHash).set({
-        ticketHash: tokenHash,
-        type: 'customer_reader',
-        targetEmail: cleanEmail,
-        requestId: params.requestId,
-        transactionCode: params.transactionCode || null,
-        createdAt: ticket.createdAt,
-        expiresAt: ticket.expiresAt,
-        isConsumed: false,
-        consumedAt: null,
-        consumedByEmail: null,
-        consumedByUid: null,
-        singleUse: true,
-      });
+      await db.collection('accessTickets').doc(tokenHash).set(ticketDoc);
       console.log(`[ACCESS TICKET STORED] Persisted SHA-256 hashed reader ticket in Firestore for ${cleanEmail} (Req: ${params.requestId})`);
     } catch (err: any) {
-      console.warn(`[ACCESS TICKET FIRESTORE WARNING] Failed to persist ticket in Firestore, relying on memory cache: ${err.message}`);
+      console.error(`[ACCESS TICKET FIRESTORE WRITE ERROR] Failed to persist ticket in Firestore: ${err.message}`);
+      throw new Error(`Failed to store access ticket in database: ${err.message}`);
     }
 
     return token;
@@ -114,6 +100,7 @@ export class AccessTicketStore {
   /**
    * Consume a customer reader ticket (OTP operation).
    * Operates via Firestore atomic transaction to prevent replay attacks across multiple serverless instances.
+   * Strictly fails closed: zero in-memory fallback.
    */
   static async consumeCustomerReaderTicket(params: {
     ticketId: string;
@@ -124,6 +111,7 @@ export class AccessTicketStore {
     reason?: string;
     ticket?: AccessTicket;
     entitlement?: BookEntitlementRecord;
+    isSystemError?: boolean;
   }> {
     const rawTicket = (params.ticketId || '').trim();
     const requestingEmail = (params.email || '').trim().toLowerCase();
@@ -139,23 +127,27 @@ export class AccessTicketStore {
     const consumedAt = new Date().toISOString();
     const userUid = params.uid || `usr_${requestingEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
 
+    const ticketRef = db.collection('accessTickets').doc(tokenHash);
+    const entRef = db.collection('bookEntitlements').doc(`${userUid}_dating-wrong`);
+
     try {
-      const ticketRef = db.collection('accessTickets').doc(tokenHash);
-
       const result = await db.runTransaction(async (transaction) => {
+        // --- ALL READS FIRST ---
         const doc = await transaction.get(ticketRef);
-        let ticketData: AccessTicket | null = null;
 
-        if (doc.exists) {
-          ticketData = doc.data() as AccessTicket;
-        } else if (this.ticketCache.has(tokenHash)) {
-          ticketData = this.ticketCache.get(tokenHash)!;
-        }
-
-        if (!ticketData || ticketData.type !== 'customer_reader') {
+        if (!doc.exists) {
           return {
             valid: false,
             reason: 'Invalid or unrecognized access ticket. Please sign in with your authorized Google account.',
+          };
+        }
+
+        const ticketData = doc.data() as AccessTicket;
+
+        if (ticketData.type !== 'customer_reader') {
+          return {
+            valid: false,
+            reason: 'Invalid access ticket type.',
           };
         }
 
@@ -168,7 +160,7 @@ export class AccessTicketStore {
         }
 
         // 2. Check expiration
-        if (new Date() > new Date(ticketData.expiresAt)) {
+        if (Date.now() > new Date(ticketData.expiresAt).getTime()) {
           return {
             valid: false,
             reason: 'This access ticket has expired. Please restore your access or contact support.',
@@ -184,17 +176,15 @@ export class AccessTicketStore {
           };
         }
 
-        // 4. Mark ticket as permanently consumed inside transaction
+        const entitlementDoc = await transaction.get(entRef);
+
+        // --- ALL WRITES PERFORMED STRICTLY AFTER ALL READS ---
         transaction.update(ticketRef, {
           isConsumed: true,
           consumedAt,
           consumedByEmail: requestingEmail || ticketData.targetEmail,
           consumedByUid: params.uid || null,
         });
-
-        // 5. Create or verify entitlement document in Firestore
-        const entitlementRef = db.collection('bookEntitlements').doc(`${userUid}_dating-wrong`);
-        const entitlementDoc = await transaction.get(entitlementRef);
 
         let entitlement: BookEntitlementRecord;
         if (entitlementDoc.exists) {
@@ -213,16 +203,13 @@ export class AccessTicketStore {
             lastSyncedAt: consumedAt,
             watermark: `Authorized Digital Edition • ${ticketData.targetEmail} • Dating Wrong`,
           };
-          transaction.set(entitlementRef, entitlement);
+          transaction.set(entRef, entitlement);
         }
 
-        // Update local memory cache
         ticketData.isConsumed = true;
         ticketData.consumedAt = consumedAt;
         ticketData.consumedByEmail = requestingEmail || ticketData.targetEmail;
         ticketData.consumedByUid = params.uid;
-        this.ticketCache.set(tokenHash, ticketData);
-        PaymentStore.setEntitlement(entitlement);
 
         return {
           valid: true,
@@ -234,37 +221,11 @@ export class AccessTicketStore {
       return result;
     } catch (err: any) {
       console.error(`[ACCESS TICKET TRANSACTION ERROR] Failed to consume ticket: ${err.message}`);
-      // Fallback to local memory verification if Firestore is unavailable
-      const cached = this.ticketCache.get(tokenHash);
-      if (cached && !cached.isConsumed && new Date() <= new Date(cached.expiresAt)) {
-        if (!requestingEmail || requestingEmail === cached.targetEmail.toLowerCase()) {
-          cached.isConsumed = true;
-          cached.consumedAt = consumedAt;
-          cached.consumedByEmail = requestingEmail || cached.targetEmail;
-          cached.consumedByUid = params.uid;
-          let ent = PaymentStore.getEntitlement(userUid, 'dating-wrong');
-          if (!ent) {
-            ent = {
-              uid: userUid,
-              bookId: 'dating-wrong',
-              bookVersion: 1,
-              status: 'ACTIVE',
-              grantedAt: consumedAt,
-              paymentId: `ENT-TKT-${cached.requestId}`,
-              transactionCode: cached.transactionCode || 'VERIFIED',
-              offlineEnabled: true,
-              authorizedDevices: [],
-              lastSyncedAt: consumedAt,
-              watermark: `Authorized Digital Edition • ${cached.targetEmail} • Dating Wrong`,
-            };
-            PaymentStore.setEntitlement(ent);
-          }
-          return { valid: true, ticket: cached, entitlement: ent };
-        }
-      }
+      // Strictly fail closed: NEVER authenticate through in-memory fallback
       return {
         valid: false,
-        reason: 'Unable to verify access ticket due to a server error. Please try again or sign in directly.',
+        reason: 'Service temporarily unavailable to verify access ticket. Please try again.',
+        isSystemError: true,
       };
     }
   }
@@ -290,8 +251,7 @@ export class AccessTicketStore {
     const hours = params.expiresInHours || 48;
     const expiresAt = new Date(now.getTime() + hours * 60 * 60 * 1000).toISOString();
 
-    const ticket: AccessTicket = {
-      ticketId: token,
+    const ticketDoc = {
       ticketHash: tokenHash,
       type: 'admin_review',
       targetEmail: cleanEmail,
@@ -299,27 +259,17 @@ export class AccessTicketStore {
       createdAt: now.toISOString(),
       expiresAt,
       isConsumed: false,
+      consumedAt: null,
+      consumedByEmail: null,
       singleUse: true,
     };
 
-    this.ticketCache.set(tokenHash, ticket);
-
     try {
-      await db.collection('accessTickets').doc(tokenHash).set({
-        ticketHash: tokenHash,
-        type: 'admin_review',
-        targetEmail: cleanEmail,
-        requestId: params.requestId,
-        createdAt: ticket.createdAt,
-        expiresAt: ticket.expiresAt,
-        isConsumed: false,
-        consumedAt: null,
-        consumedByEmail: null,
-        singleUse: true,
-      });
+      await db.collection('accessTickets').doc(tokenHash).set(ticketDoc);
       console.log(`[ADMIN TICKET STORED] Persisted SHA-256 hashed admin ticket in Firestore for ${cleanEmail} (Req: ${params.requestId})`);
     } catch (err: any) {
-      console.warn(`[ADMIN TICKET FIRESTORE WARNING] Failed to persist ticket in Firestore: ${err.message}`);
+      console.error(`[ADMIN TICKET FIRESTORE WRITE ERROR] Failed to persist ticket in Firestore: ${err.message}`);
+      throw new Error(`Failed to store admin review ticket in database: ${err.message}`);
     }
 
     return token;
@@ -328,6 +278,7 @@ export class AccessTicketStore {
   /**
    * Verify and consume an admin review ticket.
    * Operates via Firestore atomic transaction to prevent replay attacks across distributed serverless instances.
+   * Strictly fails closed.
    */
   static async verifyAndConsumeAdminTicket(params: {
     ticketId: string;
@@ -338,6 +289,7 @@ export class AccessTicketStore {
     valid: boolean;
     reason?: string;
     ticket?: AccessTicket;
+    isSystemError?: boolean;
   }> {
     const rawTicket = (params.ticketId || '').trim();
     if (!rawTicket) {
@@ -350,24 +302,26 @@ export class AccessTicketStore {
     const tokenHash = this.hashToken(rawTicket);
     const reqEmail = (params.requestingEmail || params.adminEmail || '').trim().toLowerCase();
     const consumedAt = new Date().toISOString();
+    const ticketRef = db.collection('accessTickets').doc(tokenHash);
 
     try {
-      const ticketRef = db.collection('accessTickets').doc(tokenHash);
-
       const result = await db.runTransaction(async (transaction) => {
+        // --- READS FIRST ---
         const doc = await transaction.get(ticketRef);
-        let ticketData: AccessTicket | null = null;
 
-        if (doc.exists) {
-          ticketData = doc.data() as AccessTicket;
-        } else if (this.ticketCache.has(tokenHash)) {
-          ticketData = this.ticketCache.get(tokenHash)!;
-        }
-
-        if (!ticketData || ticketData.type !== 'admin_review') {
+        if (!doc.exists) {
           return {
             valid: false,
             reason: 'Invalid or unrecognized administrative access ticket.',
+          };
+        }
+
+        const ticketData = doc.data() as AccessTicket;
+
+        if (ticketData.type !== 'admin_review') {
+          return {
+            valid: false,
+            reason: 'Invalid administrative ticket type.',
           };
         }
 
@@ -380,7 +334,7 @@ export class AccessTicketStore {
         }
 
         // 2. Check expiration
-        if (new Date() > new Date(ticketData.expiresAt)) {
+        if (Date.now() > new Date(ticketData.expiresAt).getTime()) {
           return {
             valid: false,
             reason: 'This administrative access ticket has expired.',
@@ -396,18 +350,16 @@ export class AccessTicketStore {
           };
         }
 
-        // 4. Mark consumed inside transaction
+        // --- WRITES AFTER READS ---
         transaction.update(ticketRef, {
           isConsumed: true,
           consumedAt,
           consumedByEmail: reqEmail || ticketData.targetEmail,
         });
 
-        // Update local memory cache
         ticketData.isConsumed = true;
         ticketData.consumedAt = consumedAt;
         ticketData.consumedByEmail = reqEmail || ticketData.targetEmail;
-        this.ticketCache.set(tokenHash, ticketData);
 
         console.log(`[ADMIN TICKET VERIFIED] Verified and burned single-use admin ticket for ${ticketData.targetEmail}`);
 
@@ -420,37 +372,26 @@ export class AccessTicketStore {
       return result;
     } catch (err: any) {
       console.error(`[ADMIN TICKET TRANSACTION ERROR] Failed to verify admin ticket: ${err.message}`);
-      const cached = this.ticketCache.get(tokenHash);
-      if (cached && !cached.isConsumed && new Date() <= new Date(cached.expiresAt)) {
-        if (!reqEmail || reqEmail === cached.targetEmail.toLowerCase()) {
-          cached.isConsumed = true;
-          cached.consumedAt = consumedAt;
-          cached.consumedByEmail = reqEmail || cached.targetEmail;
-          return { valid: true, ticket: cached };
-        }
-      }
       return {
         valid: false,
         reason: 'Unable to verify administrative ticket due to a server error.',
+        isSystemError: true,
       };
     }
   }
 
   /**
-   * Inspect ticket details by hash without consuming
+   * Inspect ticket details by hash without consuming (Direct Firestore Read)
    */
   static async getTicket(ticketId: string): Promise<AccessTicket | undefined> {
     const tokenHash = this.hashToken(ticketId);
-    if (this.ticketCache.has(tokenHash)) {
-      return this.ticketCache.get(tokenHash);
-    }
     try {
       const doc = await db.collection('accessTickets').doc(tokenHash).get();
       if (doc.exists) {
         return doc.data() as AccessTicket;
       }
     } catch (err: any) {
-      console.warn(`[ACCESS TICKET GET WARNING] ${err.message}`);
+      console.error(`[ACCESS TICKET GET ERROR] ${err.message}`);
     }
     return undefined;
   }

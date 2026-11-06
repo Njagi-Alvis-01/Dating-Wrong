@@ -91,6 +91,9 @@ function DatingWrongApp() {
                 if (data.targetAdmin) {
                   localStorage.setItem('dw_selected_admin_email', data.targetAdmin.toLowerCase());
                 }
+                if (data.adminSessionToken) {
+                  sessionStorage.setItem('dw_admin_session_token', data.adminSessionToken);
+                }
                 if (tabQuery) setAdminInitialTab(tabQuery as any);
                 else setAdminInitialTab('pochi_approvals');
                 setAdminFocusRequestId(reqId || null);

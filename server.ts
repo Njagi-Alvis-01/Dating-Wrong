@@ -7,6 +7,7 @@ import { PaymentStore } from './server/paymentStore.ts';
 import { NotificationService } from './server/notificationService.ts';
 import { EmailConfirmationService } from './server/emailConfirmationService.ts';
 import { AccessTicketStore } from './server/accessTicketStore.ts';
+import { requireAdminAuth, generateAdminSessionToken, ADMIN_ALLOWLIST } from './server/middleware/auth.ts';
 import { verifyPastedMpesaSms } from './src/utils/mpesaSmsParser.ts';
 import { normalizeKenyanPhone } from './src/utils/phoneNormalization.ts';
 
@@ -21,7 +22,6 @@ async function startServer() {
 
   // Strip disclosure headers and set defensive security headers across ALL responses
   app.use((req, res, next) => {
-    // Intercept header sets so no downstream middleware (including Vite or static handlers) can set x-powered-by or server headers
     const origSetHeader = res.setHeader.bind(res);
     res.setHeader = function (name: string, value: any) {
       const lower = name.toLowerCase();
@@ -71,7 +71,7 @@ async function startServer() {
       timestamp: new Date().toISOString(),
       gateway: 'Safaricom Daraja Express',
       merchantPaybill: PaymentStore.getConfig().paybill,
-      adminsConfigured: 3,
+      adminsConfigured: ADMIN_ALLOWLIST.length,
     });
   });
 
@@ -104,46 +104,50 @@ async function startServer() {
   });
 
   // Protected reader content endpoint
-  // Validates entitlement token, phone, or verified transaction code
-  app.post('/api/book/content', (req, res) => {
-    const { entitlementId, phone, transactionCode, uid } = req.body;
+  // SECURITY REQUIREMENT: Never authorize book access using a client-supplied entitlement ID or phone number alone.
+  // Requires a genuine ACTIVE Firestore entitlement or verified non-revoked transaction code.
+  app.post('/api/book/content', async (req, res) => {
+    try {
+      const { transactionCode, uid } = req.body;
 
-    let isEntitled = false;
-    let entitlementRecord: any = null;
+      let isEntitled = false;
 
-    if (uid) {
-      entitlementRecord = PaymentStore.getEntitlement(uid, 'dating-wrong');
-      if (entitlementRecord && entitlementRecord.status === 'ACTIVE') {
-        isEntitled = true;
+      if (uid && typeof uid === 'string') {
+        const entitlementRecord = await PaymentStore.getEntitlement(uid.trim(), 'dating-wrong');
+        if (entitlementRecord && entitlementRecord.status === 'ACTIVE') {
+          isEntitled = true;
+        }
       }
-    }
 
-    if (!isEntitled && transactionCode) {
-      const used = PaymentStore.getUsedTransaction(transactionCode);
-      if (used) {
-        isEntitled = true;
+      if (!isEntitled && transactionCode && typeof transactionCode === 'string') {
+        const normalized = PaymentStore.normalizeTransactionCode(transactionCode);
+        if (normalized) {
+          const used = await PaymentStore.getUsedTransaction(normalized);
+          if (used && used.status !== 'REVOKED') {
+            isEntitled = true;
+          }
+        }
       }
-    }
 
-    if (!isEntitled && (entitlementId?.startsWith('ENT-') || (phone && phone.length >= 9))) {
-      isEntitled = true;
-    }
+      if (!isEntitled) {
+        return res.status(403).json({
+          error: 'Unauthorized access',
+          message: 'A valid entitlement or verified M-PESA purchase is required to read Dating Wrong.',
+          book: 'Dating Wrong by Gerishon Wanyeki',
+          cta: 'Please complete purchase via M-PESA to unlock the protected reader.',
+        });
+      }
 
-    if (!isEntitled) {
-      return res.status(403).json({
-        error: 'Unauthorized access',
-        message: 'A valid entitlement or verified M-PESA purchase is required to read Dating Wrong.',
-        book: 'Dating Wrong by Gerishon Wanyeki',
-        cta: 'Please complete purchase via M-PESA to unlock the protected reader.',
+      res.json({
+        success: true,
+        metadata: MANUSCRIPT_V1.metadata,
+        sections: MANUSCRIPT_V1.sections,
+        authorized: true,
       });
+    } catch (err: any) {
+      console.error('[BOOK CONTENT ERROR]', err.message);
+      res.status(500).json({ error: 'Service temporarily unavailable to verify access.' });
     }
-
-    res.json({
-      success: true,
-      metadata: MANUSCRIPT_V1.metadata,
-      sections: MANUSCRIPT_V1.sections,
-      authorized: true,
-    });
   });
 
   // ==============================================================
@@ -152,57 +156,71 @@ async function startServer() {
 
   // Redeem Customer Reader Single-Use Access Ticket (One-Time Passcode)
   app.post('/api/access-tickets/consume-reader', async (req, res) => {
-    const { ticket, email, uid } = req.body;
-    if (!ticket) {
-      return res.status(400).json({ success: false, error: 'Access ticket token is required.' });
+    try {
+      const { ticket, email, uid } = req.body;
+      if (!ticket) {
+        return res.status(400).json({ success: false, error: 'Access ticket token is required.' });
+      }
+
+      const result = await AccessTicketStore.consumeCustomerReaderTicket({
+        ticketId: ticket,
+        email: email || '',
+        uid,
+      });
+
+      if (!result.valid) {
+        return res.status(403).json({ success: false, error: result.reason });
+      }
+
+      res.json({
+        success: true,
+        entitlement: result.entitlement,
+        ticket: {
+          targetEmail: result.ticket?.targetEmail,
+          requestId: result.ticket?.requestId,
+          consumedAt: result.ticket?.consumedAt,
+        },
+        message: 'Access ticket successfully redeemed and burned. Lifetime reading authorized.',
+      });
+    } catch (err: any) {
+      console.error('[CONSUME READER TICKET ERROR]', err.message);
+      res.status(500).json({ success: false, error: 'Service error redeeming ticket.' });
     }
-
-    const result = await AccessTicketStore.consumeCustomerReaderTicket({
-      ticketId: ticket,
-      email: email || '',
-      uid,
-    });
-
-    if (!result.valid) {
-      return res.status(403).json({ success: false, error: result.reason });
-    }
-
-    res.json({
-      success: true,
-      entitlement: result.entitlement,
-      ticket: {
-        targetEmail: result.ticket?.targetEmail,
-        requestId: result.ticket?.requestId,
-        consumedAt: result.ticket?.consumedAt,
-      },
-      message: 'Access ticket successfully redeemed and burned. Lifetime reading authorized.',
-    });
   });
 
   // Verify and Burn Admin Single-Use Review Ticket (One-Time Passcode)
   app.post('/api/access-tickets/verify-admin', async (req, res) => {
-    const { ticket, authAdmin, currentAuthEmail, requestId } = req.body;
-    if (!ticket) {
-      return res.status(400).json({ success: false, error: 'Admin ticket token is required.' });
+    try {
+      const { ticket, authAdmin, currentAuthEmail, requestId } = req.body;
+      if (!ticket) {
+        return res.status(400).json({ success: false, error: 'Admin ticket token is required.' });
+      }
+
+      const result = await AccessTicketStore.verifyAndConsumeAdminTicket({
+        ticketId: ticket,
+        adminEmail: authAdmin,
+        requestingEmail: currentAuthEmail,
+        requestId,
+      });
+
+      if (!result.valid) {
+        return res.status(403).json({ success: false, error: result.reason });
+      }
+
+      const targetEmail = (result.ticket?.targetEmail || authAdmin || '').trim().toLowerCase();
+      const adminSessionToken = generateAdminSessionToken(targetEmail);
+
+      res.json({
+        success: true,
+        targetAdmin: targetEmail,
+        requestId: result.ticket?.requestId,
+        adminSessionToken,
+        message: 'Administrative ticket verified and authorized.',
+      });
+    } catch (err: any) {
+      console.error('[VERIFY ADMIN TICKET ERROR]', err.message);
+      res.status(500).json({ success: false, error: 'Service error verifying admin ticket.' });
     }
-
-    const result = await AccessTicketStore.verifyAndConsumeAdminTicket({
-      ticketId: ticket,
-      adminEmail: authAdmin,
-      requestingEmail: currentAuthEmail,
-      requestId,
-    });
-
-    if (!result.valid) {
-      return res.status(403).json({ success: false, error: result.reason });
-    }
-
-    res.json({
-      success: true,
-      targetAdmin: result.ticket?.targetEmail,
-      requestId: result.ticket?.requestId,
-      message: 'Administrative ticket verified and authorized.',
-    });
   });
 
   // ==========================================
@@ -243,7 +261,7 @@ async function startServer() {
       });
 
       // Create Payment Session in Backend Store
-      const paymentRecord = PaymentStore.createPaymentSession({
+      const paymentRecord = await PaymentStore.createPaymentSession({
         uid: userUid,
         email: customerEmail,
         customerName,
@@ -276,24 +294,29 @@ async function startServer() {
   });
 
   // Step 2: Check M-PESA STK Push Status
-  app.get('/api/payments/mpesa/status/:checkoutRequestId', (req, res) => {
-    const { checkoutRequestId } = req.params;
-    const payment = PaymentStore.getPaymentByCheckoutRequestId(checkoutRequestId);
+  app.get('/api/payments/mpesa/status/:checkoutRequestId', async (req, res) => {
+    try {
+      const { checkoutRequestId } = req.params;
+      const payment = await PaymentStore.getPaymentByCheckoutRequestId(checkoutRequestId);
 
-    if (!payment) {
-      return res.status(404).json({ error: 'Payment request not found' });
+      if (!payment) {
+        return res.status(404).json({ error: 'Payment request not found' });
+      }
+
+      res.json({
+        paymentId: payment.paymentId,
+        checkoutRequestId,
+        status: payment.status,
+        receiptNumber: payment.transactionCode || null,
+        amount: payment.receivedAmount || payment.expectedAmount,
+        phone: payment.checkoutPhone,
+        securityChecksPassed: payment.securityChecksPassed,
+        failureReason: payment.failureReason || null,
+      });
+    } catch (err: any) {
+      console.error('[MPESA STATUS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to retrieve payment status' });
     }
-
-    res.json({
-      paymentId: payment.paymentId,
-      checkoutRequestId,
-      status: payment.status,
-      receiptNumber: payment.transactionCode || null,
-      amount: payment.receivedAmount || payment.expectedAmount,
-      phone: payment.checkoutPhone,
-      securityChecksPassed: payment.securityChecksPassed,
-      failureReason: payment.failureReason || null,
-    });
   });
 
   // Step 3: Daraja Webhook Callback (Called directly by Safaricom servers upon PIN authorization)
@@ -302,7 +325,7 @@ async function startServer() {
     try {
       const parsed = daraja.parseCallback(req.body);
 
-      const payment = PaymentStore.getPaymentByCheckoutRequestId(parsed.checkoutRequestId);
+      const payment = await PaymentStore.getPaymentByCheckoutRequestId(parsed.checkoutRequestId);
       if (!payment) {
         console.warn(`[Daraja Callback] No payment session found for CheckoutRequestID ${parsed.checkoutRequestId}`);
         return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
@@ -338,13 +361,12 @@ async function startServer() {
   });
 
   // Step 4: Customer Prompt Confirmation / Sandbox Simulation Endpoint
-  // Handles reader who entered PIN on their phone or tests flow in preview
   app.post('/api/payments/mpesa/confirm-pin-entry', async (req, res) => {
     try {
       const { checkoutRequestId, customCode, uid, name, email, phone, amount } = req.body;
 
       const payment = checkoutRequestId
-        ? PaymentStore.getPaymentByCheckoutRequestId(checkoutRequestId)
+        ? await PaymentStore.getPaymentByCheckoutRequestId(checkoutRequestId)
         : null;
 
       const config = PaymentStore.getConfig();
@@ -428,7 +450,6 @@ async function startServer() {
         });
 
         if (!smsVerification.isValid) {
-          // Log security check failure
           if (smsVerification.decision === 'UNDERPAID') {
             await NotificationService.notifyAllThreeAdmins({
               customerName: targetName,
@@ -455,14 +476,15 @@ async function startServer() {
         extractedAmount = smsVerification.extractedAmount!;
       }
 
-      if (!extractedCode || extractedCode.length < 8) {
+      const normalizedCode = PaymentStore.normalizeTransactionCode(extractedCode);
+      if (!normalizedCode || normalizedCode.length < 8) {
         return res.status(400).json({
           error: 'Please enter a valid 10-character M-PESA transaction code (e.g. RK72QM9XLP)',
         });
       }
 
       // Check transaction uniqueness before granting
-      const existingUse = PaymentStore.getUsedTransaction(extractedCode);
+      const existingUse = await PaymentStore.getUsedTransaction(normalizedCode);
       if (existingUse) {
         await NotificationService.notifyAllThreeAdmins({
           customerName: targetName,
@@ -470,7 +492,7 @@ async function startServer() {
           customerPhone: checkoutPhone,
           amount: extractedAmount,
           expectedAmount: config.priceKes,
-          transactionCode: extractedCode,
+          transactionCode: normalizedCode,
           status: 'DUPLICATE',
           verificationMethod: 'pasted_sms',
         });
@@ -478,7 +500,7 @@ async function startServer() {
         return res.status(409).json({
           success: false,
           decision: 'DUPLICATE',
-          error: `Transaction code ${extractedCode} has already been used to unlock the book for another account. A transaction code can only unlock the book once.`,
+          error: `Transaction code ${normalizedCode} has already been used to unlock the book for another account. A transaction code can only unlock the book once.`,
         });
       }
 
@@ -489,7 +511,7 @@ async function startServer() {
         customerName: targetName,
         senderPhone: checkoutPhone,
         amountReceived: extractedAmount,
-        transactionCode: extractedCode,
+        transactionCode: normalizedCode,
         verificationMethod: 'pasted_sms',
         rawReference,
       });
@@ -517,9 +539,6 @@ async function startServer() {
 
   // =========================================================================
   // M-PESA POCHI LA BIASHARA PAYMENT VERIFICATION FLOW
-  // User signs in with Google -> Gets Pochi guidelines -> Submits pasted SMS ->
-  // Payment request created with PENDING_REVIEW -> 3 admins notified ->
-  // Admin approves -> Entitlement granted to user Google account
   // =========================================================================
 
   // Public Pochi configuration for checkout
@@ -547,7 +566,7 @@ async function startServer() {
       }
 
       // Check if user already has an active entitlement
-      const existingEnt = PaymentStore.getEntitlement(uid, 'dating-wrong');
+      const existingEnt = await PaymentStore.getEntitlement(uid, 'dating-wrong');
       if (existingEnt && existingEnt.status === 'ACTIVE') {
         return res.json({
           success: true,
@@ -575,7 +594,8 @@ async function startServer() {
         }
       }
 
-      if (!code || code.length < 8) {
+      const normalizedCode = code ? PaymentStore.normalizeTransactionCode(code) : '';
+      if (!normalizedCode || normalizedCode.length < 8) {
         return res.status(400).json({
           success: false,
           error: 'Could not extract a valid 10-character M-PESA transaction code from the pasted SMS. Please paste the full message starting with the transaction code.',
@@ -594,16 +614,9 @@ async function startServer() {
         }
       }
 
-      // Extract sender phone or normalize
       const effectiveSenderPhone = senderPhone || parsed.extractedPhone || parsed.parsed.senderPhone || '254700000000';
-
-      // Extract time in SMS
       const transactionTime = parsed.parsed.dateTimeStr || 'Stated in SMS';
-
-      // Extract recipient
       const recipientDetails = parsed.parsed.recipient || PaymentStore.getPochiConfig().pochiName;
-
-      // Extract sender name
       const senderName = parsed.parsed.senderName || customerName || 'Valued Reader';
 
       const host = req.headers['x-forwarded-host'] || req.get('host');
@@ -616,7 +629,7 @@ async function startServer() {
         email: email.trim().toLowerCase(),
         customerName: customerName || senderName,
         submittedSms: submittedSms.trim(),
-        transactionCode: code,
+        transactionCode: normalizedCode,
         amount,
         senderPhone: effectiveSenderPhone,
         senderName,
@@ -632,7 +645,7 @@ async function startServer() {
         status: 'PENDING_REVIEW',
         request: result.request,
         parsedDetails: {
-          transactionCode: code,
+          transactionCode: normalizedCode,
           amount,
           senderPhone: effectiveSenderPhone,
           senderName,
@@ -650,47 +663,54 @@ async function startServer() {
   });
 
   // Check status of a specific payment request (polled by customer UI)
-  app.get('/api/payments/pochi/request-status/:requestId', (req, res) => {
-    const { requestId } = req.params;
-    const request = PaymentStore.getPaymentRequest(requestId);
+  app.get('/api/payments/pochi/request-status/:requestId', async (req, res) => {
+    try {
+      const { requestId } = req.params;
+      const request = await PaymentStore.getPaymentRequest(requestId);
 
-    if (!request) {
-      return res.status(404).json({ success: false, error: 'Payment request not found.' });
+      if (!request) {
+        return res.status(404).json({ success: false, error: 'Payment request not found.' });
+      }
+
+      let entitlement = null;
+      if (request.status === 'APPROVED') {
+        entitlement = await PaymentStore.getEntitlement(request.uid, 'dating-wrong');
+      }
+
+      res.json({
+        success: true,
+        request,
+        status: request.status,
+        entitlement,
+      });
+    } catch (err: any) {
+      console.error('[POCHI REQUEST STATUS ERROR]', err.message);
+      res.status(500).json({ success: false, error: 'Failed to retrieve payment request status' });
     }
-
-    let entitlement = null;
-    if (request.status === 'APPROVED') {
-      entitlement = PaymentStore.getEntitlement(request.uid, 'dating-wrong');
-    }
-
-    res.json({
-      success: true,
-      request,
-      status: request.status,
-      entitlement,
-    });
   });
 
   // Get user's payment requests
-  app.get('/api/payments/pochi/user-requests', (req, res) => {
-    const uid = req.query.uid as string;
-    const email = req.query.email as string;
+  app.get('/api/payments/pochi/user-requests', async (req, res) => {
+    try {
+      const uid = req.query.uid as string;
+      const email = req.query.email as string;
 
-    if (!uid && !email) {
-      return res.status(400).json({ error: 'uid or email query param required' });
+      if (!uid && !email) {
+        return res.status(400).json({ error: 'uid or email query param required' });
+      }
+
+      const requests = await PaymentStore.getUserPaymentRequests({ uid, email });
+      res.json({
+        success: true,
+        requests,
+      });
+    } catch (err: any) {
+      console.error('[POCHI USER REQUESTS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to retrieve payment requests' });
     }
-
-    const requests = PaymentStore.getUserPaymentRequests({ uid, email });
-    res.json({
-      success: true,
-      requests,
-    });
   });
 
-  // Restore Access Flow:
-  // User enters email and pastes SMS -> leads to database of approved accounts.
-  // If SMS and email are mapped in approved accounts -> approve and return entitlement.
-  // If not found -> returns redirectToBuy: true to guide user to buying page from sign-in to payment instruction & admin approval.
+  // Restore Access Flow
   app.post('/api/payments/pochi/restore-by-sms', async (req, res) => {
     try {
       const { email, smsText, uid } = req.body;
@@ -703,7 +723,7 @@ async function startServer() {
         });
       }
 
-      const result = PaymentStore.restoreApprovedPaymentBySms({
+      const result = await PaymentStore.restoreApprovedPaymentBySms({
         email,
         smsText,
         uid,
@@ -741,237 +761,273 @@ async function startServer() {
 
   // ==========================================
   // SECTION 28 & 29: DEVICE AUTHORIZATION & OFFLINE LICENSING
-  // Maximum offline-enabled devices: 3 (No authorization to more than 3 devices per account/email)
   // ==========================================
 
   // Check entitlement by email or uid for authorized users
-  app.post('/api/entitlements/check', (req, res) => {
-    const { email, uid, deviceId, deviceName, platform } = req.body;
-    if (!email && !uid) {
-      return res.status(400).json({ error: 'Email or UID is required' });
-    }
+  app.post('/api/entitlements/check', async (req, res) => {
+    try {
+      const { email, uid, deviceId, deviceName, platform } = req.body;
+      if (!email && !uid) {
+        return res.status(400).json({ error: 'Email or UID is required' });
+      }
 
-    const checkResult = PaymentStore.checkEntitlementWithDevice({
-      email,
-      uid,
-      deviceId,
-      deviceName,
-      platform,
-    });
+      const checkResult = await PaymentStore.checkEntitlementWithDevice({
+        email,
+        uid,
+        deviceId,
+        deviceName,
+        platform,
+      });
 
-    if (checkResult.deviceLimitReached) {
+      if (checkResult.deviceLimitReached) {
+        return res.json({
+          authorized: false,
+          deviceLimitReached: true,
+          maxDevices: checkResult.maxDevices || 2,
+          reason: checkResult.reason,
+          devices: checkResult.devices || [],
+        });
+      }
+
+      if (checkResult.entitlement && checkResult.entitlement.status === 'ACTIVE') {
+        return res.json({
+          authorized: true,
+          entitlement: checkResult.entitlement,
+          isExemptAdminDevice: checkResult.isExemptAdminDevice || false,
+          deviceCount: checkResult.deviceCount,
+        });
+      }
+
       return res.json({
         authorized: false,
-        deviceLimitReached: true,
-        maxDevices: checkResult.maxDevices || 2,
-        reason: checkResult.reason,
-        devices: checkResult.devices || [],
       });
+    } catch (err: any) {
+      console.error('[ENTITLEMENT CHECK ERROR]', err.message);
+      res.status(500).json({ error: 'Service error checking entitlement.' });
     }
-
-    if (checkResult.entitlement && checkResult.entitlement.status === 'ACTIVE') {
-      return res.json({
-        authorized: true,
-        entitlement: checkResult.entitlement,
-        isExemptAdminDevice: checkResult.isExemptAdminDevice || false,
-        deviceCount: checkResult.deviceCount,
-      });
-    }
-
-    return res.json({
-      authorized: false,
-    });
   });
 
   // Get authorized devices for user (max 2 for admins, max 3 for standard readers)
-  app.get('/api/devices/:userId', (req, res) => {
-    const { userId } = req.params;
-    const emailParam = ((req.query.email as string) || '').trim().toLowerCase();
-    const cleanEmail = emailParam || (userId || '').trim().toLowerCase();
-    const isAdmin = cleanEmail === 'alvisnjagi@gmail.com' ||
-                    cleanEmail === 'wanyekigerison@gmail.com' ||
-                    cleanEmail === 'ochiengmark2908@gmail.com' ||
-                    userId.startsWith('admin_');
-    const queryKey = (isAdmin && cleanEmail.includes('@'))
-      ? `admin_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`
-      : userId;
-    const devices = PaymentStore.getUserDevices(queryKey);
-    res.json({
-      devices: devices.filter((d) => d.status === 'active'),
-      allDevices: devices,
-      maxDevices: isAdmin ? 2 : 3,
-    });
+  app.get('/api/devices/:userId', async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const emailParam = ((req.query.email as string) || '').trim().toLowerCase();
+      const cleanEmail = emailParam || (userId || '').trim().toLowerCase();
+      const isAdmin = cleanEmail === 'alvisnjagi@gmail.com' ||
+                      cleanEmail === 'wanyekigerison@gmail.com' ||
+                      cleanEmail === 'ochiengmark2908@gmail.com' ||
+                      userId.startsWith('admin_');
+      const queryKey = (isAdmin && cleanEmail.includes('@'))
+        ? `admin_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`
+        : userId;
+      const devices = await PaymentStore.getUserDevices(queryKey);
+      res.json({
+        devices: devices.filter((d) => d.status === 'active'),
+        allDevices: devices,
+        maxDevices: isAdmin ? 2 : 3,
+      });
+    } catch (err: any) {
+      console.error('[GET DEVICES ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to retrieve devices' });
+    }
   });
 
   // Authorize a device for offline reading (max 3 for readers, max 2 for admins)
-  app.post('/api/devices/authorize', (req, res) => {
-    const { userId, email, deviceId, deviceName, platform } = req.body;
-    if (!userId || !deviceId) {
-      return res.status(400).json({ error: 'userId and deviceId are required' });
-    }
+  app.post('/api/devices/authorize', async (req, res) => {
+    try {
+      const { userId, email, deviceId, deviceName, platform } = req.body;
+      if (!userId || !deviceId) {
+        return res.status(400).json({ error: 'userId and deviceId are required' });
+      }
 
-    const cleanEmail = (email || '').trim().toLowerCase();
-    const isAdmin = cleanEmail === 'alvisnjagi@gmail.com' ||
-                    cleanEmail === 'wanyekigerison@gmail.com' ||
-                    cleanEmail === 'ochiengmark2908@gmail.com' ||
-                    userId.startsWith('admin_');
-    const targetUserId = (isAdmin && cleanEmail.includes('@'))
-      ? `admin_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`
-      : userId;
+      const cleanEmail = (email || '').trim().toLowerCase();
+      const isAdmin = cleanEmail === 'alvisnjagi@gmail.com' ||
+                      cleanEmail === 'wanyekigerison@gmail.com' ||
+                      cleanEmail === 'ochiengmark2908@gmail.com' ||
+                      userId.startsWith('admin_');
+      const targetUserId = (isAdmin && cleanEmail.includes('@'))
+        ? `admin_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`
+        : userId;
 
-    const result = PaymentStore.authorizeDevice({
-      userId: targetUserId,
-      email,
-      deviceId,
-      deviceName: deviceName || 'Reader Device',
-      platform: platform || 'desktop',
-    });
-
-    if (!result.success) {
-      const maxAllowed = isAdmin ? 2 : 3;
-      return res.status(403).json({
-        success: false,
-        reason: result.reason,
-        message: isAdmin
-          ? 'Admin device exemption limit reached (Max 2 Devices). Please revoke an unused device from your Account to authorize this device.'
-          : `You have reached the maximum of ${maxAllowed} authorized devices using this email address. Please revoke an unused device from your Account to authorize this device.`,
-        devices: result.devices,
+      const result = await PaymentStore.authorizeDevice({
+        userId: targetUserId,
+        email,
+        deviceId,
+        deviceName: deviceName || 'Reader Device',
+        platform: platform || 'desktop',
       });
-    }
 
-    res.json({
-      success: true,
-      device: result.device,
-      activeDevices: result.devices,
-      maxDevices: isAdmin ? 2 : 3,
-    });
+      if (!result.success) {
+        const maxAllowed = isAdmin ? 2 : 3;
+        return res.status(403).json({
+          success: false,
+          reason: result.reason,
+          message: isAdmin
+            ? 'Admin device exemption limit reached (Max 2 Devices). Please revoke an unused device from your Account to authorize this device.'
+            : `You have reached the maximum of ${maxAllowed} authorized devices using this email address. Please revoke an unused device from your Account to authorize this device.`,
+          devices: result.devices,
+        });
+      }
+
+      res.json({
+        success: true,
+        device: result.device,
+        activeDevices: result.devices,
+        maxDevices: isAdmin ? 2 : 3,
+      });
+    } catch (err: any) {
+      console.error('[AUTHORIZE DEVICE ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to authorize device' });
+    }
   });
 
   // Revoke an authorized device (free up slot for replacement)
-  app.post('/api/devices/revoke', (req, res) => {
-    const { userId, deviceId, email } = req.body;
-    if (!userId || !deviceId) {
-      return res.status(400).json({ error: 'userId and deviceId are required' });
+  app.post('/api/devices/revoke', async (req, res) => {
+    try {
+      const { userId, deviceId, email } = req.body;
+      if (!userId || !deviceId) {
+        return res.status(400).json({ error: 'userId and deviceId are required' });
+      }
+
+      const cleanEmail = (email || '').trim().toLowerCase();
+      const isAdmin = cleanEmail === 'alvisnjagi@gmail.com' ||
+                      cleanEmail === 'wanyekigerison@gmail.com' ||
+                      cleanEmail === 'ochiengmark2908@gmail.com' ||
+                      userId.startsWith('admin_');
+      const targetKey = (isAdmin && cleanEmail.includes('@'))
+        ? `admin_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`
+        : userId;
+
+      const revokedTarget = await PaymentStore.revokeDevice(targetKey, deviceId);
+      const revokedUser = !revokedTarget && targetKey !== userId ? await PaymentStore.revokeDevice(userId, deviceId) : false;
+      const revoked = revokedTarget || revokedUser;
+      const activeDevices = (await PaymentStore.getUserDevices(targetKey)).filter((d) => d.status === 'active');
+
+      res.json({
+        success: revoked,
+        message: revoked
+          ? 'Device revoked successfully. You may now authorize a replacement device.'
+          : 'Device was not found or already inactive.',
+        activeDevices,
+      });
+    } catch (err: any) {
+      console.error('[REVOKE DEVICE ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to revoke device' });
     }
-
-    const cleanEmail = (email || '').trim().toLowerCase();
-    const isAdmin = cleanEmail === 'alvisnjagi@gmail.com' ||
-                    cleanEmail === 'wanyekigerison@gmail.com' ||
-                    cleanEmail === 'ochiengmark2908@gmail.com' ||
-                    userId.startsWith('admin_');
-    const targetKey = (isAdmin && cleanEmail.includes('@'))
-      ? `admin_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`
-      : userId;
-
-    const revoked = PaymentStore.revokeDevice(targetKey, deviceId) || PaymentStore.revokeDevice(userId, deviceId);
-    res.json({
-      success: revoked,
-      message: revoked
-        ? 'Device revoked successfully. You may now authorize a replacement device.'
-        : 'Device was not found or already inactive.',
-      activeDevices: PaymentStore.getUserDevices(targetKey).filter((d) => d.status === 'active'),
-    });
   });
 
   // Verify and renew offline license
-  app.post('/api/devices/verify-license', (req, res) => {
-    const { userId, deviceId, licenseId } = req.body;
-    if (!userId || !deviceId) {
-      return res.status(400).json({ valid: false, error: 'Missing credentials' });
-    }
+  app.post('/api/devices/verify-license', async (req, res) => {
+    try {
+      const { userId, deviceId, licenseId } = req.body;
+      if (!userId || !deviceId) {
+        return res.status(400).json({ valid: false, error: 'Missing credentials' });
+      }
 
-    const devices = PaymentStore.getUserDevices(userId);
-    const active = devices.find((d) => d.deviceId === deviceId && d.status === 'active');
+      const devices = await PaymentStore.getUserDevices(userId);
+      const active = devices.find((d) => d.deviceId === deviceId && d.status === 'active');
 
-    if (!active) {
-      return res.json({
-        valid: false,
-        reason: 'Device authorization has been revoked or expired.',
-      });
-    }
+      if (!active) {
+        return res.json({
+          valid: false,
+          reason: 'Device authorization has been revoked or expired.',
+        });
+      }
 
-    // License is valid; issue renewed expiration timestamp (30 days from now)
-    const renewedExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      const renewedExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
-    res.json({
-      valid: true,
-      renewedLicense: {
-        licenseId: licenseId || `LIC-${Date.now()}`,
-        userId,
-        bookId: 'dating-wrong',
-        bookVersion: 1,
-        issuedAt: new Date().toISOString(),
-        expiresAt: renewedExpiresAt,
-        authorizedDevice: {
-          deviceId,
-          deviceName: active.deviceName,
-          platform: active.platform,
+      res.json({
+        valid: true,
+        renewedLicense: {
+          licenseId: licenseId || `LIC-${Date.now()}`,
+          userId,
+          bookId: 'dating-wrong',
+          bookVersion: 1,
+          issuedAt: new Date().toISOString(),
+          expiresAt: renewedExpiresAt,
+          authorizedDevice: {
+            deviceId,
+            deviceName: active.deviceName,
+            platform: active.platform,
+          },
+          offlineEnabled: true,
+          licenseVersion: 1,
         },
-        offlineEnabled: true,
-        licenseVersion: 1,
-      },
-    });
+      });
+    } catch (err: any) {
+      console.error('[VERIFY LICENSE ERROR]', err.message);
+      res.status(500).json({ valid: false, error: 'Failed to verify license' });
+    }
   });
 
-  // Issue or verify signed offline Entitlement Token
-  app.post('/api/entitlements/issue-token', (req, res) => {
-    const { uid, deviceId, bookId } = req.body;
-    if (!uid || !deviceId) {
-      return res.status(400).json({ error: 'uid and deviceId are required' });
+  // Issue signed offline Entitlement Token
+  app.post('/api/entitlements/issue-token', async (req, res) => {
+    try {
+      const { uid, deviceId, bookId } = req.body;
+      if (!uid || !deviceId) {
+        return res.status(400).json({ error: 'uid and deviceId are required' });
+      }
+
+      const entitlement = await PaymentStore.getEntitlement(uid, bookId || 'dating-wrong');
+      if (!entitlement || entitlement.status !== 'ACTIVE') {
+        return res.status(403).json({ error: 'User does not possess an active entitlement for this book' });
+      }
+
+      const issuedAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      const tokenId = `TOK_${Date.now()}_${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
+
+      const payload = {
+        tokenId,
+        entitlementId: entitlement.paymentId,
+        userId: uid,
+        bookId: entitlement.bookId,
+        bookVersion: entitlement.bookVersion,
+        deviceId,
+        transactionCode: entitlement.transactionCode,
+        scope: 'read:offline',
+        issuedAt,
+        expiresAt,
+        status: 'active',
+        watermarkText: entitlement.watermark,
+      };
+
+      res.json({
+        success: true,
+        payload,
+        expiresAt,
+      });
+    } catch (err: any) {
+      console.error('[ISSUE TOKEN ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to issue offline entitlement token' });
     }
-
-    const entitlement = PaymentStore.getEntitlement(uid, bookId || 'dating-wrong');
-    if (!entitlement || entitlement.status !== 'ACTIVE') {
-      return res.status(403).json({ error: 'User does not possess an active entitlement for this book' });
-    }
-
-    const issuedAt = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-    const tokenId = `TOK_${Date.now()}_${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
-
-    const payload = {
-      tokenId,
-      entitlementId: entitlement.paymentId,
-      userId: uid,
-      bookId: entitlement.bookId,
-      bookVersion: entitlement.bookVersion,
-      deviceId,
-      transactionCode: entitlement.transactionCode,
-      scope: 'read:offline',
-      issuedAt,
-      expiresAt,
-      status: 'active',
-      watermarkText: entitlement.watermark,
-    };
-
-    res.json({
-      success: true,
-      payload,
-      expiresAt,
-    });
   });
 
-  app.post('/api/entitlements/verify-token', (req, res) => {
-    const { tokenPayload } = req.body;
-    if (!tokenPayload || !tokenPayload.userId || !tokenPayload.deviceId) {
-      return res.status(400).json({ valid: false, error: 'Invalid token payload' });
-    }
+  app.post('/api/entitlements/verify-token', async (req, res) => {
+    try {
+      const { tokenPayload } = req.body;
+      if (!tokenPayload || !tokenPayload.userId || !tokenPayload.deviceId) {
+        return res.status(400).json({ valid: false, error: 'Invalid token payload' });
+      }
 
-    const entitlement = PaymentStore.getEntitlement(tokenPayload.userId, tokenPayload.bookId || 'dating-wrong');
-    if (!entitlement || entitlement.status !== 'ACTIVE') {
-      return res.json({ valid: false, reason: 'Entitlement not active or revoked on server' });
-    }
+      const entitlement = await PaymentStore.getEntitlement(tokenPayload.userId, tokenPayload.bookId || 'dating-wrong');
+      if (!entitlement || entitlement.status !== 'ACTIVE') {
+        return res.json({ valid: false, reason: 'Entitlement not active or revoked on server' });
+      }
 
-    const isExpired = new Date(tokenPayload.expiresAt).getTime() <= Date.now();
-    if (isExpired) {
-      return res.json({ valid: false, reason: 'Offline token lease expired' });
-    }
+      const isExpired = new Date(tokenPayload.expiresAt).getTime() <= Date.now();
+      if (isExpired) {
+        return res.json({ valid: false, reason: 'Offline token lease expired' });
+      }
 
-    res.json({ valid: true });
+      res.json({ valid: true });
+    } catch (err: any) {
+      console.error('[VERIFY TOKEN ERROR]', err.message);
+      res.status(500).json({ valid: false, error: 'Failed to verify token' });
+    }
   });
 
   // Section 36: Transaction Status & Reconciliation Mechanism
-  // Allows querying/reconciling transactions without depending exclusively on callback
   app.post('/api/payments/mpesa/reconcile/:paymentSessionId', async (req, res) => {
     const { paymentSessionId } = req.params;
     try {
@@ -988,110 +1044,131 @@ async function startServer() {
     }
   });
 
-  // Section 39: Reading Progress Storage (readingProgress/{uid_bookId})
-  app.get('/api/reading-progress/:uid/:bookId', (req, res) => {
-    const { uid, bookId } = req.params;
-    const progress = PaymentStore.getReadingProgress(uid, bookId);
-    res.json(progress || { uid, bookId, currentPage: 1, percentage: 0, lastReadAt: null });
-  });
-
-  app.post('/api/reading-progress', (req, res) => {
-    const { uid, bookId, currentPage, percentage } = req.body;
-    if (!uid || !bookId) {
-      return res.status(400).json({ error: 'uid and bookId are required' });
+  // Reading Progress Storage
+  app.get('/api/reading-progress/:uid/:bookId', async (req, res) => {
+    try {
+      const { uid, bookId } = req.params;
+      const progress = await PaymentStore.getReadingProgress(uid, bookId);
+      res.json(progress || { uid, bookId, currentPage: 1, percentage: 0, lastReadAt: null });
+    } catch (err: any) {
+      console.error('[GET PROGRESS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to retrieve reading progress' });
     }
-    const saved = PaymentStore.saveReadingProgress({
-      uid,
-      bookId,
-      currentPage: Number(currentPage) || 1,
-      percentage: Number(percentage) || 0,
-    });
-    res.json({ success: true, progress: saved });
   });
 
-  // Section 40: Bookmarks
-  app.get('/api/bookmarks/:uid/:bookId', (req, res) => {
-    const { uid, bookId } = req.params;
-    const bookmarks = PaymentStore.getBookmarks(uid, bookId);
-    res.json({ bookmarks });
-  });
-
-  app.post('/api/bookmarks', (req, res) => {
-    const { uid, bookId, page, chapter, note } = req.body;
-    if (!uid || !bookId || page == null) {
-      return res.status(400).json({ error: 'uid, bookId, and page are required' });
+  app.post('/api/reading-progress', async (req, res) => {
+    try {
+      const { uid, bookId, currentPage, percentage } = req.body;
+      if (!uid || !bookId) {
+        return res.status(400).json({ error: 'uid and bookId are required' });
+      }
+      const saved = await PaymentStore.saveReadingProgress({
+        uid,
+        bookId,
+        currentPage: Number(currentPage) || 1,
+        percentage: Number(percentage) || 0,
+      });
+      res.json({ success: true, progress: saved });
+    } catch (err: any) {
+      console.error('[SAVE PROGRESS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to save reading progress' });
     }
-    const updated = PaymentStore.saveBookmark(uid, bookId, {
-      page: Number(page),
-      chapter: chapter || 'Chapter',
-      createdAt: new Date().toISOString(),
-      note,
-    });
-    res.json({ success: true, bookmarks: updated });
   });
 
-  app.delete('/api/bookmarks/:uid/:bookId/:page', (req, res) => {
-    const { uid, bookId, page } = req.params;
-    const updated = PaymentStore.deleteBookmark(uid, bookId, Number(page));
-    res.json({ success: true, bookmarks: updated });
-  });
-
-  // Admin Role Check Middleware helper
-  const verifyAdminRole = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const email = req.headers['x-admin-email'] as string;
-    const role = req.headers['x-user-role'] as string;
-    const isAdmin =
-      role === 'admin' ||
-      role === 'superAdmin' ||
-      (email && (email === 'alvisnjagi@gmail.com' || email === 'wanyekigerison@gmail.com' || email === 'ochiengmark2908@gmail.com'));
-
-    if (!isAdmin) {
-      return res.status(403).json({ error: 'Access denied. Administrator privileges required.' });
+  // Bookmarks
+  app.get('/api/bookmarks/:uid/:bookId', async (req, res) => {
+    try {
+      const { uid, bookId } = req.params;
+      const bookmarks = await PaymentStore.getBookmarks(uid, bookId);
+      res.json({ bookmarks });
+    } catch (err: any) {
+      console.error('[GET BOOKMARKS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to retrieve bookmarks' });
     }
-    next();
-  };
+  });
+
+  app.post('/api/bookmarks', async (req, res) => {
+    try {
+      const { uid, bookId, page, chapter, note } = req.body;
+      if (!uid || !bookId || page == null) {
+        return res.status(400).json({ error: 'uid, bookId, and page are required' });
+      }
+      const updated = await PaymentStore.saveBookmark(uid, bookId, {
+        page: Number(page),
+        chapter: chapter || 'Chapter',
+        createdAt: new Date().toISOString(),
+        note,
+      });
+      res.json({ success: true, bookmarks: updated });
+    } catch (err: any) {
+      console.error('[SAVE BOOKMARK ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to save bookmark' });
+    }
+  });
+
+  app.delete('/api/bookmarks/:uid/:bookId/:page', async (req, res) => {
+    try {
+      const { uid, bookId, page } = req.params;
+      const updated = await PaymentStore.deleteBookmark(uid, bookId, Number(page));
+      res.json({ success: true, bookmarks: updated });
+    } catch (err: any) {
+      console.error('[DELETE BOOKMARK ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to delete bookmark' });
+    }
+  });
+
+  // ==============================================================
+  // PROTECTED ADMINISTRATOR ENDPOINTS
+  // Strictly protected with requireAdminAuth (Firebase Admin ID tokens / Admin session tokens)
+  // Enforces 3-administrator allowlist on every endpoint
+  // ==============================================================
 
   // Section 42: Admin Dashboard Metrics & Statistics
-  app.get('/api/admin/stats', verifyAdminRole, (req, res) => {
-    const all = PaymentStore.getAllPayments();
-    const verified = all.filter((p) => p.status === 'VERIFIED');
-    const pending = all.filter((p) => p.status === 'PENDING' || p.status === 'STK_SENT');
-    const underpaid = all.filter((p) => p.status === 'UNDERPAID');
-    const failed = all.filter((p) => p.status === 'FAILED' || p.status === 'REJECTED' || p.status === 'INVALID_CODE');
-    const manualReview = all.filter((p) => p.status === 'MANUAL_REVIEW');
-    const duplicate = all.filter((p) => p.status === 'DUPLICATE');
+  app.get('/api/admin/stats', requireAdminAuth, async (req, res) => {
+    try {
+      const all = await PaymentStore.getAllPayments();
+      const verified = all.filter((p) => p.status === 'VERIFIED');
+      const pending = all.filter((p) => p.status === 'PENDING' || p.status === 'STK_SENT');
+      const underpaid = all.filter((p) => p.status === 'UNDERPAID');
+      const failed = all.filter((p) => p.status === 'FAILED' || p.status === 'REJECTED' || p.status === 'INVALID_CODE');
+      const manualReview = all.filter((p) => p.status === 'MANUAL_REVIEW');
+      const duplicate = all.filter((p) => p.status === 'DUPLICATE');
 
-    const totalRevenue = verified.reduce((sum, p) => sum + (p.receivedAmount || p.expectedAmount), 0);
-    const allDevices = Array.from(PaymentStore['userDevices'].values()).flat();
-    const activeOfflineDevices = allDevices.filter((d) => d.status === 'active').length;
+      const totalRevenue = verified.reduce((sum, p) => sum + (p.receivedAmount || p.expectedAmount), 0);
+      const allRequests = await PaymentStore.getAllPaymentRequests();
+      const approvedCount = allRequests.filter((r) => r.status === 'APPROVED').length;
 
-    res.json({
-      totalReaders: verified.length,
-      verifiedPurchases: verified.length,
-      pendingPayments: pending.length,
-      underpaidPayments: underpaid.length,
-      failedPayments: failed.length,
-      manualReviewPayments: manualReview.length,
-      duplicatePayments: duplicate.length,
-      revenue: totalRevenue,
-      activeEntitlements: PaymentStore['entitlements'].size,
-      offlineUsers: activeOfflineDevices,
-      recentPurchases: all.slice(0, 15),
-    });
+      res.json({
+        totalReaders: verified.length + approvedCount,
+        verifiedPurchases: verified.length,
+        pendingPayments: pending.length,
+        underpaidPayments: underpaid.length,
+        failedPayments: failed.length,
+        manualReviewPayments: manualReview.length,
+        duplicatePayments: duplicate.length,
+        revenue: totalRevenue,
+        activeEntitlements: verified.length + approvedCount,
+        offlineUsers: 0,
+        recentPurchases: all.slice(0, 15),
+      });
+    } catch (err: any) {
+      console.error('[ADMIN STATS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to compute admin statistics' });
+    }
   });
 
   // Section 46: SMS Monitoring Logs
-  app.get('/api/admin/sms-logs', verifyAdminRole, (req, res) => {
+  app.get('/api/admin/sms-logs', requireAdminAuth, (req, res) => {
     res.json({ logs: NotificationService.getRecentLogs() });
   });
 
   // Section 37: Customer Email Confirmation Logs
-  app.get('/api/admin/email-logs', verifyAdminRole, (req, res) => {
+  app.get('/api/admin/email-logs', requireAdminAuth, (req, res) => {
     res.json({ logs: EmailConfirmationService.getRecentEmailLogs() });
   });
 
   // Section 44: Admin Book Management
-  app.post('/api/admin/book-config', verifyAdminRole, (req, res) => {
+  app.post('/api/admin/book-config', requireAdminAuth, (req, res) => {
     const { title, subtitle, priceKes, activeVersion, publisher } = req.body;
     if (priceKes) {
       PaymentStore.setConfiguredPrice(Number(priceKes));
@@ -1110,73 +1187,87 @@ async function startServer() {
   });
 
   // Admin: View all payments and audit logs
-  app.get('/api/admin/payments', (req, res) => {
-    const all = PaymentStore.getAllPayments();
-    res.json({
-      payments: all,
-      totalCount: all.length,
-      verifiedCount: all.filter((p) => p.status === 'VERIFIED').length,
-      underpaidCount: all.filter((p) => p.status === 'UNDERPAID').length,
-      duplicateCount: all.filter((p) => p.status === 'DUPLICATE').length,
-    });
+  app.get('/api/admin/payments', requireAdminAuth, async (req, res) => {
+    try {
+      const all = await PaymentStore.getAllPayments();
+      res.json({
+        payments: all,
+        totalCount: all.length,
+        verifiedCount: all.filter((p) => p.status === 'VERIFIED').length,
+        underpaidCount: all.filter((p) => p.status === 'UNDERPAID').length,
+        duplicateCount: all.filter((p) => p.status === 'DUPLICATE').length,
+      });
+    } catch (err: any) {
+      console.error('[ADMIN PAYMENTS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to load payments' });
+    }
   });
 
   // Admin: View Pochi verification requests queue
-  app.get('/api/admin/payment-requests', verifyAdminRole, (req, res) => {
-    const requests = PaymentStore.getAllPaymentRequests();
-    const pending = requests.filter((r) => r.status === 'PENDING_REVIEW');
-    const approved = requests.filter((r) => r.status === 'APPROVED');
-    const rejected = requests.filter((r) => r.status === 'REJECTED');
+  app.get('/api/admin/payment-requests', requireAdminAuth, async (req, res) => {
+    try {
+      const requests = await PaymentStore.getAllPaymentRequests();
+      const pending = requests.filter((r) => r.status === 'PENDING_REVIEW');
+      const approved = requests.filter((r) => r.status === 'APPROVED');
+      const rejected = requests.filter((r) => r.status === 'REJECTED');
 
-    res.json({
-      success: true,
-      requests,
-      counts: {
-        total: requests.length,
-        pending: pending.length,
-        approved: approved.length,
-        rejected: rejected.length,
-      },
-    });
+      res.json({
+        success: true,
+        requests,
+        counts: {
+          total: requests.length,
+          pending: pending.length,
+          approved: approved.length,
+          rejected: rejected.length,
+        },
+      });
+    } catch (err: any) {
+      console.error('[ADMIN PAYMENT REQUESTS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to load payment requests' });
+    }
   });
 
-  // Admin: Get total number of mapped users with their exact required details:
-  // email, sms, transactional code, time bought, the admin who approved
-  app.get('/api/admin/mapped-users', verifyAdminRole, (req, res) => {
-    const allRequests = PaymentStore.getAllPaymentRequests();
-    const approvedRequests = allRequests.filter((r) => r.status === 'APPROVED');
+  // Admin: Get total number of mapped users
+  app.get('/api/admin/mapped-users', requireAdminAuth, async (req, res) => {
+    try {
+      const allRequests = await PaymentStore.getAllPaymentRequests();
+      const approvedRequests = allRequests.filter((r) => r.status === 'APPROVED');
 
-    const mappedUsers = approvedRequests.map((r) => ({
-      email: r.email,
-      sms: r.submittedSms,
-      transactionalCode: r.transactionCode,
-      timeBought: r.transactionTime || r.submittedAt,
-      submittedAt: r.submittedAt,
-      approvedAt: r.reviewedAt || r.submittedAt,
-      adminWhoApproved: r.reviewedBy || 'Super Admin',
-      amount: r.amount,
-      customerName: r.customerName,
-      senderPhone: r.senderPhone,
-      requestId: r.requestId,
-      entitlementId: r.entitlementId,
-    }));
+      const mappedUsers = approvedRequests.map((r) => ({
+        email: r.email,
+        sms: r.submittedSms,
+        transactionalCode: r.transactionCode,
+        timeBought: r.transactionTime || r.submittedAt,
+        submittedAt: r.submittedAt,
+        approvedAt: r.reviewedAt || r.submittedAt,
+        adminWhoApproved: r.reviewedBy || 'Super Admin',
+        amount: r.amount,
+        customerName: r.customerName,
+        senderPhone: r.senderPhone,
+        requestId: r.requestId,
+        entitlementId: r.entitlementId,
+      }));
 
-    res.json({
-      success: true,
-      totalMappedUsers: mappedUsers.length,
-      users: mappedUsers,
-    });
+      res.json({
+        success: true,
+        totalMappedUsers: mappedUsers.length,
+        users: mappedUsers,
+      });
+    } catch (err: any) {
+      console.error('[ADMIN MAPPED USERS ERROR]', err.message);
+      res.status(500).json({ error: 'Failed to load mapped users' });
+    }
   });
 
   // Admin: Notification Toggle for Pending Approvals
-  app.get('/api/admin/notifications/toggle', verifyAdminRole, (req, res) => {
+  app.get('/api/admin/notifications/toggle', requireAdminAuth, (req, res) => {
     res.json({
       success: true,
       pendingApprovalsNotificationsEnabled: NotificationService.isPendingApprovalsNotificationsEnabled(),
     });
   });
 
-  app.post('/api/admin/notifications/toggle', verifyAdminRole, (req, res) => {
+  app.post('/api/admin/notifications/toggle', requireAdminAuth, (req, res) => {
     const { enabled } = req.body;
     const newState = NotificationService.setPendingApprovalsNotificationsEnabled(Boolean(enabled));
     res.json({
@@ -1188,14 +1279,11 @@ async function startServer() {
     });
   });
 
-  // Admin: Approve a payment verification request (Any one of Mark, Gerishon, or Alvis)
-  app.post('/api/admin/payment-requests/:requestId/approve', verifyAdminRole, async (req, res) => {
+  // Admin: Approve a payment verification request
+  app.post('/api/admin/payment-requests/:requestId/approve', requireAdminAuth, async (req, res) => {
     const { requestId } = req.params;
-    const adminEmail = (req.body.adminEmail as string) ||
-                       (req.headers['x-admin-email'] as string) ||
-                       (req.body.adminName as string) ||
-                       'Authorized Admin';
-    const cleanAdminEmail = adminEmail.trim().toLowerCase();
+    const verifiedAdmin = (req as any).adminUser?.email || (req.body.adminEmail as string) || 'Authorized Admin';
+    const cleanAdminEmail = verifiedAdmin.trim().toLowerCase();
     const notes = req.body.notes;
 
     try {
@@ -1216,13 +1304,10 @@ async function startServer() {
   });
 
   // Admin: Reject a payment verification request
-  app.post('/api/admin/payment-requests/:requestId/reject', verifyAdminRole, async (req, res) => {
+  app.post('/api/admin/payment-requests/:requestId/reject', requireAdminAuth, async (req, res) => {
     const { requestId } = req.params;
-    const adminEmail = (req.body.adminEmail as string) ||
-                       (req.headers['x-admin-email'] as string) ||
-                       (req.body.adminName as string) ||
-                       'Authorized Admin';
-    const cleanAdminEmail = adminEmail.trim().toLowerCase();
+    const verifiedAdmin = (req as any).adminUser?.email || (req.body.adminEmail as string) || 'Authorized Admin';
+    const cleanAdminEmail = verifiedAdmin.trim().toLowerCase();
     const reason = req.body.reason || 'Payment could not be verified in Pochi records.';
 
     try {
@@ -1239,7 +1324,7 @@ async function startServer() {
   });
 
   // Admin: Reassign or update the exact administrator email mapped with an approval
-  app.post('/api/admin/payment-requests/:requestId/reassign-approver', verifyAdminRole, (req, res) => {
+  app.post('/api/admin/payment-requests/:requestId/reassign-approver', requireAdminAuth, async (req, res) => {
     const { requestId } = req.params;
     const { adminEmail } = req.body;
     if (!adminEmail) {
@@ -1247,7 +1332,7 @@ async function startServer() {
     }
     const cleanAdminEmail = (adminEmail as string).trim().toLowerCase();
     try {
-      const updated = PaymentStore.updateRequestApprover(requestId, cleanAdminEmail);
+      const updated = await PaymentStore.updateRequestApprover(requestId, cleanAdminEmail);
       res.json({
         success: true,
         message: `Approval attribution updated to ${cleanAdminEmail}`,
@@ -1258,11 +1343,10 @@ async function startServer() {
     }
   });
 
-  // Security Measure: Admin Delete & Permanently Revoke User
-  // If a user hacked, manipulated, or bypassed payment, permanently expunge them.
-  app.post('/api/admin/users/delete', verifyAdminRole, async (req, res) => {
+  // Admin: Permanently Revoke & Expunge User
+  app.post('/api/admin/users/delete', requireAdminAuth, async (req, res) => {
     const { userIdentifier, email, uid, requestId } = req.body;
-    const adminEmail = (req.headers['x-admin-email'] as string) || (req.body.adminEmail as string) || 'Authorized Admin';
+    const verifiedAdmin = (req as any).adminUser?.email || (req.body.adminEmail as string) || 'Authorized Admin';
     const target = userIdentifier || email || uid || requestId;
 
     if (!target) {
@@ -1270,7 +1354,7 @@ async function startServer() {
     }
 
     try {
-      const result = PaymentStore.deleteAndRevokeUser(target, adminEmail);
+      const result = await PaymentStore.deleteAndRevokeUser(target, verifiedAdmin);
       res.json(result);
     } catch (err: any) {
       console.error('[ADMIN DELETE USER ERROR]', err.message);
@@ -1278,11 +1362,11 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/admin/users/:userIdentifier', verifyAdminRole, async (req, res) => {
+  app.delete('/api/admin/users/:userIdentifier', requireAdminAuth, async (req, res) => {
     const { userIdentifier } = req.params;
-    const adminEmail = (req.headers['x-admin-email'] as string) || 'Authorized Admin';
+    const verifiedAdmin = (req as any).adminUser?.email || 'Authorized Admin';
     try {
-      const result = PaymentStore.deleteAndRevokeUser(userIdentifier, adminEmail);
+      const result = await PaymentStore.deleteAndRevokeUser(userIdentifier, verifiedAdmin);
       res.json(result);
     } catch (err: any) {
       console.error('[ADMIN DELETE USER ERROR]', err.message);
@@ -1291,7 +1375,7 @@ async function startServer() {
   });
 
   // Admin: Update Pochi la Biashara configuration
-  app.post('/api/admin/config/pochi', verifyAdminRole, (req, res) => {
+  app.post('/api/admin/config/pochi', requireAdminAuth, (req, res) => {
     const { pochiPhone, pochiName, priceKes, instructions } = req.body;
     PaymentStore.updatePochiConfig({
       pochiPhone,
