@@ -362,7 +362,7 @@ export class NotificationService {
       const messageId = `POCHI-ALERT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 
       // Generate a cryptographic, single-use OTP ticket mapped strictly to this administrator
-      const ticketId = AccessTicketStore.createAdminReviewTicket({
+      const ticketId = await AccessTicketStore.createAdminReviewTicket({
         adminEmail: admin.email,
         requestId: payload.requestId,
       });

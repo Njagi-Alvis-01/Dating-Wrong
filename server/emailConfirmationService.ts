@@ -97,7 +97,7 @@ export class EmailConfirmationService {
         : this.activeBaseUrl;
 
     // Cryptographically generated single-use OTP token strictly mapped to this customer's email
-    const ticketToken = AccessTicketStore.createCustomerReaderTicket({
+    const ticketToken = await AccessTicketStore.createCustomerReaderTicket({
       email: params.customerEmail,
       requestId: params.transactionReference,
       transactionCode: params.transactionReference,

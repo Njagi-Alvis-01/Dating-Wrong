@@ -12,7 +12,9 @@ import { normalizeKenyanPhone } from './src/utils/phoneNormalization.ts';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const portArgIdx = process.argv.indexOf('--port');
+  const portFromArgs = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? parseInt(process.argv[portArgIdx + 1], 10) : undefined;
+  const PORT = Number(process.env.PORT) || portFromArgs || 3000;
 
   // Security Hardening: Hide server version, technology stack, and remove all disclosure headers
   app.disable('x-powered-by');
@@ -51,6 +53,9 @@ async function startServer() {
     }
     next();
   });
+
+  // Hydrate persistent data stores from Firestore
+  await PaymentStore.initFromFirestore();
 
   const daraja = new DarajaService();
 
@@ -146,13 +151,13 @@ async function startServer() {
   // ==============================================================
 
   // Redeem Customer Reader Single-Use Access Ticket (One-Time Passcode)
-  app.post('/api/access-tickets/consume-reader', (req, res) => {
+  app.post('/api/access-tickets/consume-reader', async (req, res) => {
     const { ticket, email, uid } = req.body;
     if (!ticket) {
       return res.status(400).json({ success: false, error: 'Access ticket token is required.' });
     }
 
-    const result = AccessTicketStore.consumeCustomerReaderTicket({
+    const result = await AccessTicketStore.consumeCustomerReaderTicket({
       ticketId: ticket,
       email: email || '',
       uid,
@@ -175,13 +180,13 @@ async function startServer() {
   });
 
   // Verify and Burn Admin Single-Use Review Ticket (One-Time Passcode)
-  app.post('/api/access-tickets/verify-admin', (req, res) => {
+  app.post('/api/access-tickets/verify-admin', async (req, res) => {
     const { ticket, authAdmin, currentAuthEmail, requestId } = req.body;
     if (!ticket) {
       return res.status(400).json({ success: false, error: 'Admin ticket token is required.' });
     }
 
-    const result = AccessTicketStore.verifyAndConsumeAdminTicket({
+    const result = await AccessTicketStore.verifyAndConsumeAdminTicket({
       ticketId: ticket,
       adminEmail: authAdmin,
       requestingEmail: currentAuthEmail,
@@ -1326,7 +1331,10 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1338,10 +1346,18 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Dating Wrong platform running on http://0.0.0.0:${PORT}`);
     console.log(`Daraja M-PESA STK Push gateway initialized for Mark & Alvis Publishers`);
     console.log(`Admin alert dispatch active for Gerishon Wanyeki, Alvis Njagi, and Mark`);
+  });
+
+  server.on('error', (err: any) => {
+    if (err.code === 'EADDRINUSE') {
+      console.warn(`[SERVER WARNING] Port ${PORT} already bound or in use by dev supervisor.`);
+    } else {
+      console.error('[SERVER ERROR]', err);
+    }
   });
 }
 

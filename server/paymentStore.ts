@@ -26,6 +26,7 @@ import { normalizeKenyanPhone, arePhonesEqual } from '../src/utils/phoneNormaliz
 import { NotificationService } from './notificationService.ts';
 import { EmailConfirmationService } from './emailConfirmationService.ts';
 import { parseMpesaSms } from '../src/utils/mpesaSmsParser.ts';
+import { db } from './firebaseAdmin.ts';
 
 export type PaymentStatus =
   | 'CREATED'
@@ -209,6 +210,56 @@ export class PaymentStore {
   }
 
   /**
+   * Hydrate in-memory cache with persisted Firestore documents on startup
+   */
+  static async initFromFirestore(): Promise<void> {
+    try {
+      // 1. Entitlements
+      const entSnap = await db.collection('bookEntitlements').get();
+      entSnap.forEach((doc) => {
+        const data = doc.data() as BookEntitlementRecord;
+        if (data && data.uid && data.bookId) {
+          this.entitlements.set(`${data.uid}_${data.bookId}`, data);
+        }
+      });
+
+      // 2. Payment Requests
+      const reqSnap = await db.collection('paymentRequests').get();
+      reqSnap.forEach((doc) => {
+        const data = doc.data() as PaymentRequestRecord;
+        if (data && data.requestId) {
+          this.paymentRequests.set(data.requestId, data);
+        }
+      });
+
+      // 3. Used Transactions
+      const usedSnap = await db.collection('usedTransactions').get();
+      usedSnap.forEach((doc) => {
+        const data = doc.data() as UsedTransactionRecord;
+        if (data && data.transactionCode) {
+          this.usedTransactions.set(data.transactionCode, data);
+        }
+      });
+
+      // 4. Payments
+      const paySnap = await db.collection('payments').get();
+      paySnap.forEach((doc) => {
+        const data = doc.data() as PaymentRecord;
+        if (data && data.paymentId) {
+          this.payments.set(data.paymentId, data);
+          if (data.checkoutRequestId) {
+            this.checkoutSessionIndex.set(data.checkoutRequestId, data.paymentId);
+          }
+        }
+      });
+
+      console.log(`[FIRESTORE SYNC] Hydrated ${this.entitlements.size} entitlements, ${this.paymentRequests.size} requests, ${this.usedTransactions.size} transactions from Firestore.`);
+    } catch (err: any) {
+      console.warn(`[FIRESTORE HYDRATE NOTICE] ${err.message}`);
+    }
+  }
+
+  /**
    * 1. Create a Payment Session (Section 34)
    */
   static createPaymentSession(params: {
@@ -279,6 +330,10 @@ export class PaymentStore {
 
   static setEntitlement(record: BookEntitlementRecord): void {
     this.entitlements.set(`${record.uid}_${record.bookId}`, record);
+    db.collection('bookEntitlements')
+      .doc(`${record.uid}_${record.bookId}`)
+      .set(record, { merge: true })
+      .catch((err) => console.warn(`[FIRESTORE ENTITLEMENT WRITE WARNING] ${err.message}`));
   }
 
   static checkEntitlementWithDevice(params: {
@@ -1091,6 +1146,14 @@ export class PaymentStore {
       updatedAt: submittedAt,
     });
 
+    // Persist to Firestore collections for distributed persistence
+    try {
+      await db.collection('paymentRequests').doc(requestId).set(requestRecord);
+      await db.collection('payments').doc(paymentId).set(this.payments.get(paymentId)!, { merge: true });
+    } catch (fsErr: any) {
+      console.warn(`[FIRESTORE PAYMENT REQUEST WRITE WARNING] ${fsErr.message}`);
+    }
+
     // 2. Dispatch notifications to all 3 Administrators (Mark, Gerishon, Alvis)
     try {
       await NotificationService.notifyAllThreeAdminsOfPochiRequest({
@@ -1146,9 +1209,9 @@ export class PaymentStore {
    * On approval:
    * - Status becomes APPROVED
    * - Entitlement is granted to the customer's Google account
-   * - Transaction code is locked against duplicates
-   * - Confirmation email is dispatched to the customer
-   */
+    * - Transaction code is locked against duplicates
+    * - Confirmation email is dispatched to the customer
+    */
   static async approvePaymentRequest(
     requestId: string,
     adminIdentifier: string,
@@ -1159,94 +1222,163 @@ export class PaymentStore {
     request: PaymentRequestRecord;
     entitlement: BookEntitlementRecord;
   }> {
-    const req = this.paymentRequests.get(requestId);
-    if (!req) {
-      throw new Error(`Payment request ${requestId} not found.`);
-    }
-
     const normalizedAdmin = (adminIdentifier || '').trim().toLowerCase();
-
-    if (req.status === 'APPROVED') {
-      const existingEnt = this.getEntitlement(req.uid, 'dating-wrong');
-      if (existingEnt) {
-        if (normalizedAdmin && normalizedAdmin !== (req.reviewedBy || '').toLowerCase()) {
-          req.reviewedBy = normalizedAdmin;
-        }
-        return { success: true, request: req, entitlement: existingEnt };
-      }
-    }
-
     const reviewedAt = new Date().toISOString();
     const entitlementId = `ENT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const reqRef = db.collection('paymentRequests').doc(requestId);
 
-    req.status = 'APPROVED';
-    req.reviewedBy = normalizedAdmin || adminIdentifier;
-    req.reviewedAt = reviewedAt;
-    req.entitlementId = entitlementId;
-    if (notes) {
-      req.rejectionReason = null;
-    }
-
-    // Grant Active Entitlement
-    const entitlement: BookEntitlementRecord = {
-      uid: req.uid,
-      bookId: 'dating-wrong',
-      bookVersion: 1,
-      status: 'ACTIVE',
-      grantedAt: reviewedAt,
-      paymentId: entitlementId,
-      transactionCode: req.transactionCode,
-      offlineEnabled: true,
-      authorizedDevices: [],
-      lastSyncedAt: reviewedAt,
-      watermark: `Authorized Digital Edition • ${req.email} • Dating Wrong`,
-    };
-
-    this.entitlements.set(`${req.uid}_dating-wrong`, entitlement);
-
-    // Record used transaction to prevent replay
-    this.usedTransactions.set(req.transactionCode, {
-      transactionCode: req.transactionCode,
-      usedForUid: req.uid,
-      paymentId: entitlementId,
-      amount: req.amount,
-      usedAt: reviewedAt,
-      phone: req.senderPhone,
-    });
-
-    // Update associated payment record
-    const paymentId = `PAY-POCHI-${requestId}`;
-    const p = this.payments.get(paymentId);
-    if (p) {
-      p.status = 'VERIFIED';
-      p.verifiedAt = reviewedAt;
-      p.securityChecksPassed = true;
-      p.updatedAt = reviewedAt;
-    }
-
-    // Dispatch customer email confirmation with working activeBaseUrl
     try {
-      const activeUrl = baseUrl || NotificationService.getActiveBaseUrl() || process.env.APP_URL || '';
-      await EmailConfirmationService.sendBookReadyEmail({
-        customerName: req.customerName,
-        customerEmail: req.email,
-        transactionReference: req.transactionCode,
-        amount: req.amount,
-        currency: 'KES',
-        accessUrl: activeUrl,
-        purchasedAt: reviewedAt,
+      const result = await db.runTransaction(async (transaction) => {
+        const reqDoc = await transaction.get(reqRef);
+        let req: PaymentRequestRecord;
+
+        if (reqDoc.exists) {
+          req = reqDoc.data() as PaymentRequestRecord;
+        } else {
+          const localReq = this.paymentRequests.get(requestId);
+          if (!localReq) {
+            throw new Error(`Payment request ${requestId} not found.`);
+          }
+          req = localReq;
+        }
+
+        // Idempotency check: If already approved, return existing record
+        if (req.status === 'APPROVED') {
+          const existingEnt = this.getEntitlement(req.uid, 'dating-wrong');
+          if (existingEnt) {
+            if (normalizedAdmin && normalizedAdmin !== (req.reviewedBy || '').toLowerCase()) {
+              req.reviewedBy = normalizedAdmin;
+            }
+            return { success: true, request: req, entitlement: existingEnt };
+          }
+        }
+
+        // Check M-Pesa transaction code uniqueness inside transaction
+        const usedTxRef = db.collection('usedTransactions').doc(req.transactionCode);
+        const usedTxDoc = await transaction.get(usedTxRef);
+        if (usedTxDoc.exists) {
+          const existingUsed = usedTxDoc.data() as UsedTransactionRecord;
+          if (existingUsed.usedForUid !== req.uid) {
+            throw new Error(`Transaction code ${req.transactionCode} has already been approved for another customer.`);
+          }
+        }
+
+        req.status = 'APPROVED';
+        req.reviewedBy = normalizedAdmin || adminIdentifier;
+        req.reviewedAt = reviewedAt;
+        req.entitlementId = entitlementId;
+        if (notes) {
+          req.rejectionReason = null;
+        }
+
+        // Grant Active Entitlement
+        const entitlement: BookEntitlementRecord = {
+          uid: req.uid,
+          bookId: 'dating-wrong',
+          bookVersion: 1,
+          status: 'ACTIVE',
+          grantedAt: reviewedAt,
+          paymentId: entitlementId,
+          transactionCode: req.transactionCode,
+          offlineEnabled: true,
+          authorizedDevices: [],
+          lastSyncedAt: reviewedAt,
+          watermark: `Authorized Digital Edition • ${req.email} • Dating Wrong`,
+        };
+
+        const usedRecord: UsedTransactionRecord = {
+          transactionCode: req.transactionCode,
+          usedForUid: req.uid,
+          paymentId: entitlementId,
+          amount: req.amount,
+          usedAt: reviewedAt,
+          phone: req.senderPhone,
+        };
+
+        const paymentId = `PAY-POCHI-${requestId}`;
+        const paymentRef = db.collection('payments').doc(paymentId);
+        const existingPayment = this.payments.get(paymentId);
+        const updatedPayment: PaymentRecord = {
+          paymentId,
+          paymentSessionId: requestId,
+          uid: req.uid,
+          email: req.email,
+          customerName: req.customerName,
+          phone: req.senderPhone,
+          checkoutPhone: req.senderPhone,
+          normalizedPhone: normalizeKenyanPhone(req.senderPhone).canonical,
+          expectedAmount: req.expectedAmount || this.configuredPriceKes,
+          receivedAmount: req.amount,
+          transactionCode: req.transactionCode,
+          recipient: req.recipientDetails,
+          bookId: 'dating-wrong',
+          bookVersion: 1,
+          status: 'VERIFIED',
+          provider: 'pasted_sms',
+          checkoutCreatedAt: req.submittedAt,
+          expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+          securityChecksPassed: true,
+          adminAlertSent: true,
+          createdAt: req.submittedAt,
+          updatedAt: reviewedAt,
+          verifiedAt: reviewedAt,
+          ...(existingPayment || {}),
+        };
+
+        // Transactional Atomic Writes
+        transaction.set(reqRef, req, { merge: true });
+        transaction.set(usedTxRef, usedRecord);
+        transaction.set(db.collection('bookEntitlements').doc(`${req.uid}_dating-wrong`), entitlement);
+        transaction.set(paymentRef, updatedPayment, { merge: true });
+
+        // Record real-time audit action for multi-admin synchronization stream
+        const actionRef = db.collection('adminActions').doc();
+        transaction.set(actionRef, {
+          actionId: actionRef.id,
+          adminEmail: normalizedAdmin || adminIdentifier,
+          action: 'APPROVE_PAYMENT',
+          requestId,
+          transactionCode: req.transactionCode,
+          targetEmail: req.email,
+          timestamp: reviewedAt,
+        });
+
+        // Update local memory caches
+        this.paymentRequests.set(requestId, req);
+        this.entitlements.set(`${req.uid}_dating-wrong`, entitlement);
+        this.usedTransactions.set(req.transactionCode, usedRecord);
+        this.payments.set(paymentId, updatedPayment);
+
+        return {
+          success: true,
+          request: req,
+          entitlement,
+        };
       });
-    } catch (emailErr: any) {
-      console.warn('[Customer Email Confirmation Warning]', emailErr.message);
+
+      // Dispatch customer email confirmation
+      try {
+        const activeUrl = baseUrl || NotificationService.getActiveBaseUrl() || process.env.APP_URL || '';
+        await EmailConfirmationService.sendBookReadyEmail({
+          customerName: result.request.customerName,
+          customerEmail: result.request.email,
+          transactionReference: result.request.transactionCode,
+          amount: result.request.amount,
+          currency: 'KES',
+          accessUrl: activeUrl,
+          purchasedAt: reviewedAt,
+        });
+      } catch (emailErr: any) {
+        console.warn('[Customer Email Confirmation Warning]', emailErr.message);
+      }
+
+      console.log(`[POCHI APPROVAL] Request ${requestId} approved atomically in Firestore by ${normalizedAdmin || adminIdentifier}. Entitlement granted to ${result.request.email}.`);
+
+      return result;
+    } catch (txErr: any) {
+      console.error(`[POCHI APPROVAL ERROR] Transaction failed: ${txErr.message}`);
+      throw txErr;
     }
-
-    console.log(`[POCHI APPROVAL] Request ${requestId} approved by ${normalizedAdmin || adminIdentifier}. Entitlement granted to ${req.email} (${req.uid}).`);
-
-    return {
-      success: true,
-      request: req,
-      entitlement,
-    };
   }
 
   /**
@@ -1261,44 +1393,87 @@ export class PaymentStore {
     success: boolean;
     request: PaymentRequestRecord;
   }> {
-    const req = this.paymentRequests.get(requestId);
-    if (!req) {
-      throw new Error(`Payment request ${requestId} not found.`);
-    }
-
     const normalizedAdmin = (adminIdentifier || '').trim().toLowerCase();
     const reviewedAt = new Date().toISOString();
-    req.status = 'REJECTED';
-    req.reviewedBy = normalizedAdmin || adminIdentifier;
-    req.reviewedAt = reviewedAt;
-    req.rejectionReason = reason || 'Payment not verified against Pochi records';
+    const reqRef = db.collection('paymentRequests').doc(requestId);
 
-    // Update associated payment record
-    const paymentId = `PAY-POCHI-${requestId}`;
-    const p = this.payments.get(paymentId);
-    if (p) {
-      p.status = 'REJECTED';
-      p.failureReason = req.rejectionReason;
-      p.updatedAt = reviewedAt;
-    }
-
-    // Dispatch customer rejection email notification
     try {
-      await EmailConfirmationService.sendPaymentRejectionEmail({
-        customerName: req.customerName,
-        customerEmail: req.email,
-        rejectionReason: req.rejectionReason,
+      const result = await db.runTransaction(async (transaction) => {
+        const reqDoc = await transaction.get(reqRef);
+        let req: PaymentRequestRecord;
+
+        if (reqDoc.exists) {
+          req = reqDoc.data() as PaymentRequestRecord;
+        } else {
+          const localReq = this.paymentRequests.get(requestId);
+          if (!localReq) {
+            throw new Error(`Payment request ${requestId} not found.`);
+          }
+          req = localReq;
+        }
+
+        req.status = 'REJECTED';
+        req.reviewedBy = normalizedAdmin || adminIdentifier;
+        req.reviewedAt = reviewedAt;
+        req.rejectionReason = reason || 'Payment not verified against Pochi records';
+
+        const paymentId = `PAY-POCHI-${requestId}`;
+        const paymentRef = db.collection('payments').doc(paymentId);
+
+        transaction.set(reqRef, req, { merge: true });
+        transaction.set(
+          paymentRef,
+          {
+            status: 'REJECTED',
+            failureReason: req.rejectionReason,
+            updatedAt: reviewedAt,
+          },
+          { merge: true }
+        );
+
+        // Record real-time audit action
+        const actionRef = db.collection('adminActions').doc();
+        transaction.set(actionRef, {
+          actionId: actionRef.id,
+          adminEmail: normalizedAdmin || adminIdentifier,
+          action: 'REJECT_PAYMENT',
+          requestId,
+          reason: req.rejectionReason,
+          timestamp: reviewedAt,
+        });
+
+        this.paymentRequests.set(requestId, req);
+        const p = this.payments.get(paymentId);
+        if (p) {
+          p.status = 'REJECTED';
+          p.failureReason = req.rejectionReason;
+          p.updatedAt = reviewedAt;
+        }
+
+        return {
+          success: true,
+          request: req,
+        };
       });
-    } catch (emailErr: any) {
-      console.warn('[Customer Rejection Email Warning]', emailErr.message);
+
+      // Dispatch customer rejection email notification
+      try {
+        await EmailConfirmationService.sendPaymentRejectionEmail({
+          customerName: result.request.customerName,
+          customerEmail: result.request.email,
+          rejectionReason: result.request.rejectionReason,
+        });
+      } catch (emailErr: any) {
+        console.warn('[Customer Rejection Email Warning]', emailErr.message);
+      }
+
+      console.log(`[POCHI REJECTION] Request ${requestId} rejected by ${normalizedAdmin || adminIdentifier}. Reason: ${reason}`);
+
+      return result;
+    } catch (err: any) {
+      console.error(`[POCHI REJECTION ERROR] ${err.message}`);
+      throw err;
     }
-
-    console.log(`[POCHI REJECTION] Request ${requestId} rejected by ${normalizedAdmin || adminIdentifier}. Reason: ${reason}`);
-
-    return {
-      success: true,
-      request: req,
-    };
   }
 
   /**
@@ -1433,6 +1608,17 @@ export class PaymentStore {
     if (deletedUid) {
       this.readingProgressStore.delete(`${deletedUid}_dating-wrong`);
       this.userBookmarks.delete(`${deletedUid}_dating-wrong`);
+    }
+
+    // 7. Purge persistent records in Firestore
+    if (deletedUid) {
+      db.collection('bookEntitlements').doc(`${deletedUid}_dating-wrong`).delete().catch(() => {});
+      db.collection('readingProgress').doc(`${deletedUid}_dating-wrong`).delete().catch(() => {});
+      db.collection('bookmarks').doc(`${deletedUid}_dating-wrong`).delete().catch(() => {});
+      db.collection('users').doc(deletedUid).delete().catch(() => {});
+    }
+    for (const code of codesToUnlink) {
+      db.collection('usedTransactions').doc(code).delete().catch(() => {});
     }
 
     console.warn(
