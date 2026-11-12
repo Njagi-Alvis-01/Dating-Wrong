@@ -141,37 +141,25 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   // Requires a genuine ACTIVE Firestore entitlement or verified non-revoked transaction code.
   app.post('/api/book/content', async (req, res) => {
     try {
-      const { transactionCode, uid } = req.body;
-
-      let isEntitled = false;
-
-      if (uid && typeof uid === 'string') {
-        const entitlementRecord = await PaymentStore.getEntitlement(uid.trim(), 'dating-wrong');
-        if (entitlementRecord && entitlementRecord.status === 'ACTIVE') {
-          isEntitled = true;
-        }
+      const authenticatedUser = (req as any).firebaseUser as { uid: string } | undefined;
+      if (!authenticatedUser) {
+        return res.status(401).json({ error: 'Sign in to access the protected reader.' });
+      }
+      if (req.body?.uid && req.body.uid !== authenticatedUser.uid) {
+        return res.status(403).json({ error: 'The requested account does not match your signed-in account.' });
       }
 
-      if (!isEntitled && transactionCode && typeof transactionCode === 'string') {
-        const normalized = PaymentStore.normalizeTransactionCode(transactionCode);
-        if (normalized) {
-          const used = await PaymentStore.getUsedTransaction(normalized);
-          if (used && used.status !== 'REVOKED') {
-            isEntitled = true;
-          }
-        }
-      }
-
-      if (!isEntitled) {
+      const entitlementRecord = await PaymentStore.getEntitlement(authenticatedUser.uid, 'dating-wrong');
+      if (!entitlementRecord || entitlementRecord.status !== 'ACTIVE') {
         return res.status(403).json({
           error: 'Unauthorized access',
-          message: 'A valid entitlement or verified M-PESA purchase is required to read Dating Wrong.',
+          message: 'An active entitlement is required to read Dating Wrong.',
           book: 'Dating Wrong by Gerishon Wanyeki',
-          cta: 'Please complete purchase via M-PESA to unlock the protected reader.',
+          cta: 'Please complete the official purchase and administrator approval process.',
         });
       }
 
-      res.json({
+      return res.json({
         success: true,
         metadata: MANUSCRIPT_V1.metadata,
         sections: MANUSCRIPT_V1.sections,
@@ -179,7 +167,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       });
     } catch (err: any) {
       console.error('[BOOK CONTENT ERROR]', err.message);
-      res.status(500).json({ error: 'Service temporarily unavailable to verify access.' });
+      return res.status(500).json({ error: 'Service temporarily unavailable to verify access.' });
     }
   });
 
@@ -263,7 +251,11 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   // Step 1: Backend initiates genuine M-PESA STK Push via Daraja
   app.post('/api/payments/mpesa/initiate', async (req, res) => {
     try {
-      const { phone, amount, name, email, uid } = req.body;
+      const { phone, name } = req.body;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
+      if (!authenticatedUser || !authenticatedUser.emailVerified || authenticatedUser.signInProvider !== 'google.com') {
+        return res.status(401).json({ error: 'A verified Google sign-in is required to initiate payment.' });
+      }
 
       if (!phone) {
         return res.status(400).json({ error: 'Phone number is required for M-PESA payment' });
@@ -277,9 +269,9 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       }
 
       const config = PaymentStore.getConfig();
-      const expectedAmount = amount || config.priceKes;
-      const userUid = uid || `GUEST_${Date.now()}`;
-      const customerEmail = email || 'reader@datingwrong.ke';
+      const expectedAmount = config.priceKes;
+      const userUid = authenticatedUser.uid;
+      const customerEmail = authenticatedUser.email;
       const customerName = name || 'Valued Reader';
 
       // Call Daraja Service
@@ -330,10 +322,15 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.get('/api/payments/mpesa/status/:checkoutRequestId', async (req, res) => {
     try {
       const { checkoutRequestId } = req.params;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string } | undefined;
+      if (!authenticatedUser) return res.status(401).json({ error: 'Sign in to check your payment.' });
       const payment = await PaymentStore.getPaymentByCheckoutRequestId(checkoutRequestId);
 
       if (!payment) {
         return res.status(404).json({ error: 'Payment request not found' });
+      }
+      if (payment.uid !== authenticatedUser.uid) {
+        return res.status(403).json({ error: 'You are not authorized to view this payment.' });
       }
 
       res.json({
@@ -395,40 +392,38 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
 
   // Step 4: Customer Prompt Confirmation / Sandbox Simulation Endpoint
   app.post('/api/payments/mpesa/confirm-pin-entry', async (req, res) => {
+    if (process.env.MPESA_ENV !== 'sandbox') {
+      return res.status(404).json({ error: 'Sandbox confirmation is disabled in production. Safaricom callbacks are the only payment confirmation source.' });
+    }
     try {
-      const { checkoutRequestId, customCode, uid, name, email, phone, amount } = req.body;
-
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      if (!authenticatedUser) return res.status(401).json({ error: 'Sign in before testing a sandbox payment.' });
+      const { checkoutRequestId, customCode } = req.body;
       const payment = checkoutRequestId
         ? await PaymentStore.getPaymentByCheckoutRequestId(checkoutRequestId)
         : null;
+      if (!payment || payment.uid !== authenticatedUser.uid || payment.email !== authenticatedUser.email) {
+        return res.status(403).json({ error: 'A matching payment session for your signed-in account is required.' });
+      }
 
-      const config = PaymentStore.getConfig();
-      const expectedAmount = amount || payment?.expectedAmount || config.priceKes;
-      const targetPhone = phone || payment?.checkoutPhone || '254700000000';
-      const targetUid = uid || payment?.uid || `USR-${Date.now()}`;
-      const targetName = name || payment?.customerName || 'Authorized Reader';
-      const targetEmail = email || payment?.email || 'reader@datingwrong.ke';
-
-      // Generate or use code
+      const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+      const numbers = '0123456789';
       let code = (customCode || '').trim().toUpperCase();
       if (!code) {
-        const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-        const numbers = '0123456789';
         code = 'R';
         for (let i = 0; i < 2; i++) code += letters.charAt(Math.floor(Math.random() * letters.length));
         for (let i = 0; i < 2; i++) code += numbers.charAt(Math.floor(Math.random() * numbers.length));
         for (let i = 0; i < 5; i++) code += (letters + numbers).charAt(Math.floor(Math.random() * (letters.length + numbers.length)));
       }
 
-      // Execute the 9 strict security checks
       const result = await PaymentStore.verifyAndGrantEntitlement({
-        paymentId: payment?.paymentId,
+        paymentId: payment.paymentId,
         checkoutRequestId,
-        uid: targetUid,
-        email: targetEmail,
-        customerName: targetName,
-        senderPhone: targetPhone,
-        amountReceived: expectedAmount,
+        uid: authenticatedUser.uid,
+        email: authenticatedUser.email,
+        customerName: payment.customerName,
+        senderPhone: payment.checkoutPhone,
+        amountReceived: payment.expectedAmount,
         transactionCode: code,
         verificationMethod: 'daraja_stk',
       });
@@ -441,8 +436,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
           checksLog: result.checksLog,
         });
       }
-
-      res.json({
+      return res.json({
         success: true,
         status: 'VERIFIED',
         receiptNumber: code,
@@ -450,124 +444,21 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
         checksLog: result.checksLog,
       });
     } catch (err: any) {
-      console.error('Error confirming M-PESA PIN entry:', err.message);
-      res.status(500).json({ error: err.message });
+      console.error('Error confirming M-PESA sandbox payment:', err.message);
+      return res.status(500).json({ error: 'Sandbox payment confirmation failed.' });
     }
   });
 
   // =========================================================================
   // SECTION 16: PLAN B — MANUAL SMS RECEIPT & VERIFICATION
   // =========================================================================
-  app.post('/api/payments/verify-sms-or-receipt', async (req, res) => {
-    try {
-      const { smsText, receiptCode, phone, uid, name, email } = req.body;
-
-      const config = PaymentStore.getConfig();
-      const targetUid = uid || `USR_${Date.now()}`;
-      const targetEmail = email || 'reader@datingwrong.ke';
-      const targetName = name || 'Verified Reader';
-      const checkoutPhone = phone || '254700000000';
-
-      let extractedCode = (receiptCode || '').trim().toUpperCase();
-      let extractedAmount = config.priceKes;
-      let rawReference = smsText || receiptCode;
-
-      // If user provided a pasted SMS text:
-      if (smsText && smsText.trim().length > 15) {
-        const smsVerification = verifyPastedMpesaSms({
-          smsText,
-          expectedAmount: config.priceKes,
-          checkoutPhone,
-          merchantName: config.recipient,
-          paybillNumber: config.paybill,
-        });
-
-        if (!smsVerification.isValid) {
-          if (smsVerification.decision === 'UNDERPAID') {
-            await NotificationService.notifyAllThreeAdmins({
-              customerName: targetName,
-              customerEmail: targetEmail,
-              customerPhone: checkoutPhone,
-              amount: smsVerification.extractedAmount || 0,
-              expectedAmount: config.priceKes,
-              transactionCode: smsVerification.extractedCode || 'UNKNOWN',
-              status: 'UNDERPAID',
-              verificationMethod: 'pasted_sms',
-            });
-          }
-
-          return res.status(400).json({
-            success: false,
-            decision: smsVerification.decision,
-            error: smsVerification.reason || 'SMS verification check failed',
-            checks: smsVerification.checks,
-            parsed: smsVerification.parsed,
-          });
-        }
-
-        extractedCode = smsVerification.extractedCode!;
-        extractedAmount = smsVerification.extractedAmount!;
-      }
-
-      const normalizedCode = PaymentStore.normalizeTransactionCode(extractedCode);
-      if (!normalizedCode || normalizedCode.length < 8) {
-        return res.status(400).json({
-          error: 'Please enter a valid 10-character M-PESA transaction code (e.g. RK72QM9XLP)',
-        });
-      }
-
-      // Check transaction uniqueness before granting
-      const existingUse = await PaymentStore.getUsedTransaction(normalizedCode);
-      if (existingUse) {
-        await NotificationService.notifyAllThreeAdmins({
-          customerName: targetName,
-          customerEmail: targetEmail,
-          customerPhone: checkoutPhone,
-          amount: extractedAmount,
-          expectedAmount: config.priceKes,
-          transactionCode: normalizedCode,
-          status: 'DUPLICATE',
-          verificationMethod: 'pasted_sms',
-        });
-
-        return res.status(409).json({
-          success: false,
-          decision: 'DUPLICATE',
-          error: `Transaction code ${normalizedCode} has already been used to unlock the book for another account. A transaction code can only unlock the book once.`,
-        });
-      }
-
-      // Run through strict backend verification
-      const verifyResult = await PaymentStore.verifyAndGrantEntitlement({
-        uid: targetUid,
-        email: targetEmail,
-        customerName: targetName,
-        senderPhone: checkoutPhone,
-        amountReceived: extractedAmount,
-        transactionCode: normalizedCode,
-        verificationMethod: 'pasted_sms',
-        rawReference,
-      });
-
-      if (!verifyResult.passed) {
-        return res.status(400).json({
-          success: false,
-          decision: verifyResult.status,
-          error: verifyResult.failureReason,
-          checksLog: verifyResult.checksLog,
-        });
-      }
-
-      res.json({
-        success: true,
-        message: 'M-PESA transaction verified. Digital book unlocked.',
-        entitlement: verifyResult.entitlement,
-        checksLog: verifyResult.checksLog,
-      });
-    } catch (err: any) {
-      console.error('Error verifying SMS receipt:', err.message);
-      res.status(500).json({ error: err.message });
-    }
+  // Legacy pasted-SMS endpoint is disabled: customer-provided SMS must never grant access
+  // directly. The supported Pochi flow records the request and requires an administrator review.
+  app.post('/api/payments/verify-sms-or-receipt', (_req, res) => {
+    return res.status(410).json({
+      success: false,
+      error: 'This legacy verification route is retired. Submit the M-PESA SMS through the Pochi payment review flow.',
+    });
   });
 
   // =========================================================================
