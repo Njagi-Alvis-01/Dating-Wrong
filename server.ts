@@ -13,7 +13,8 @@ import { runWithRequestAuth, isUnauthenticatedPermissionError } from './server/f
 import { verifyPastedMpesaSms } from './src/utils/mpesaSmsParser.ts';
 import { normalizeKenyanPhone } from './src/utils/phoneNormalization.ts';
 
-async function startServer() {
+export async function createApp(options: { serveFrontend?: boolean } = {}) {
+  const { serveFrontend = true } = options;
   const app = express();
   const portArgIdx = process.argv.indexOf('--port');
   const portFromArgs = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? parseInt(process.argv[portArgIdx + 1], 10) : undefined;
@@ -52,6 +53,10 @@ async function startServer() {
       if (idToken) {
         try {
           const decoded = await adminAuth.verifyIdToken(idToken);
+          (req as any).firebaseUser = {
+            uid: decoded.uid,
+            email: (decoded.email || '').trim().toLowerCase(),
+          };
           return runWithRequestAuth(
             {
               uid: decoded.uid,
@@ -576,6 +581,14 @@ async function startServer() {
   app.post('/api/payments/pochi/submit-sms', async (req, res) => {
     try {
       const { uid, email, customerName, submittedSms, senderPhone } = req.body;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+
+      if (!authenticatedUser) {
+        return res.status(401).json({ success: false, error: 'A valid signed-in account is required. Please sign in again.' });
+      }
+      if (uid !== authenticatedUser.uid || String(email || '').trim().toLowerCase() !== authenticatedUser.email) {
+        return res.status(403).json({ success: false, error: 'The submitted account does not match your verified sign-in session.' });
+      }
 
       if (!uid || !email) {
         return res.status(401).json({
@@ -1479,8 +1492,9 @@ async function startServer() {
     });
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production') {
+  // Frontend hosting is handled by Vercel's static output in production.
+  // Only attach Vite/Express static middleware when running the standalone server.
+  if (serveFrontend && process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -1489,7 +1503,7 @@ async function startServer() {
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (serveFrontend) {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -1497,19 +1511,23 @@ async function startServer() {
     });
   }
 
+  return app;
+}
+
+async function startServer() {
+  const app = await createApp({ serveFrontend: true });
+  const PORT = Number(process.env.PORT) || 3000;
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Dating Wrong platform running on http://0.0.0.0:${PORT}`);
-    console.log(`Daraja M-PESA STK Push gateway initialized for Mark & Alvis Publishers`);
-    console.log(`Admin alert dispatch active for Gerishon Wanyeki, Alvis Njagi, and Mark`);
+    console.log('Daraja M-PESA STK Push gateway initialized for Mark & Alvis Publishers');
+    console.log('Admin alert dispatch active for Gerishon Wanyeki, Alvis Njagi, and Mark');
   });
-
   server.on('error', (err: any) => {
-    if (err.code === 'EADDRINUSE') {
-      console.warn(`[SERVER WARNING] Port ${PORT} already bound or in use by dev supervisor.`);
-    } else {
-      console.error('[SERVER ERROR]', err);
-    }
+    if (err.code === 'EADDRINUSE') console.warn(`[SERVER WARNING] Port ${PORT} already bound or in use by dev supervisor.`);
+    else console.error('[SERVER ERROR]', err);
   });
 }
 
-startServer();
+if (process.env.VERCEL !== '1') {
+  void startServer();
+}
