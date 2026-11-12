@@ -252,7 +252,10 @@ export class PaymentStore {
       }
       console.log(`[FIRESTORE SYNC] Hydrated server payment session indices from Firestore.`);
     } catch (err: any) {
-      console.warn(`[FIRESTORE HYDRATE NOTICE] ${err.message}`);
+      console.error(`[FIRESTORE HYDRATE ERROR] ${err.message}`);
+      if (process.env.VERCEL === '1') {
+        throw new Error(`Firestore initialization failed: ${err.message}`);
+      }
     }
   }
 
