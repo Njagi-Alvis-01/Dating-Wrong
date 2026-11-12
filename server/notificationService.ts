@@ -315,19 +315,17 @@ export class NotificationService {
     const smtpHost = process.env.SMTP_HOST;
     let transporter: any = null;
 
-    if (gmailUser && gmailPass) {
+    if (process.env.SMTP_USER && process.env.SMTP_PASS && smtpHost) {
       transporter = nodemailer.createTransport({
-        service: process.env.SMTP_HOST && process.env.GMAIL_USER
-          ? undefined
-          : 'gmail',
-        ...(smtpHost && process.env.SMTP_USER
-          ? {
-              host: smtpHost,
-              port: parseInt(process.env.SMTP_PORT || '587', 10),
-              secure: process.env.SMTP_PORT === '465',
-            }
-          : {}),
-        auth: { user: gmailUser, pass: gmailPass },
+        host: smtpHost,
+        port: parseInt(process.env.SMTP_PORT || '587', 10),
+        secure: process.env.SMTP_PORT === '465',
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+    } else if (process.env.GMAIL_USER && process.env.GMAIL_PASS) {
+      transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASS },
       });
     }
 
