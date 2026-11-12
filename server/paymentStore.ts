@@ -947,7 +947,7 @@ export class PaymentStore {
     recipientDetails?: string;
     transactionTime?: string;
     baseUrl?: string;
-  }): Promise<{ request: PaymentRequestRecord; isDuplicate: boolean; alreadyApproved: boolean }> {
+  }): Promise<{ request: PaymentRequestRecord; isDuplicate: boolean; alreadyApproved: boolean; notificationResult: Awaited<ReturnType<typeof NotificationService.notifyAllThreeAdminsOfPochiRequest>> | null }> {
     const cleanEmail = params.email.trim().toLowerCase();
     const code = normalizeTransactionCode(params.transactionCode);
 
@@ -1013,7 +1013,7 @@ export class PaymentStore {
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
       rawReference: params.submittedSms,
       securityChecksPassed: false,
-      adminAlertSent: true,
+      adminAlertSent: false,
       createdAt: submittedAt,
       updatedAt: submittedAt,
     };
@@ -1024,9 +1024,10 @@ export class PaymentStore {
       { type: 'set', col: 'payments', docId: paymentId, data: paymentRecord },
     ]);
 
-    // Dispatch notifications to all 3 Administrators
+    // Dispatch notifications to all three administrators and record actual delivery status.
+    let notificationResult: Awaited<ReturnType<typeof NotificationService.notifyAllThreeAdminsOfPochiRequest>> | null = null;
     try {
-      await NotificationService.notifyAllThreeAdminsOfPochiRequest({
+      notificationResult = await NotificationService.notifyAllThreeAdminsOfPochiRequest({
         customerName: requestRecord.customerName,
         customerEmail: cleanEmail,
         customerPhone: requestRecord.senderPhone,
@@ -1041,14 +1042,21 @@ export class PaymentStore {
         status: 'PENDING_ADMIN_APPROVAL',
         baseUrl: params.baseUrl,
       });
+      if (notificationResult.success) {
+        paymentRecord.adminAlertSent = true;
+        await fsUpdateDoc('payments', paymentId, { adminAlertSent: true, updatedAt: new Date().toISOString() });
+      } else {
+        console.error('[ADMIN NOTIFICATION INCOMPLETE]', JSON.stringify(notificationResult.dispatchedTo));
+      }
     } catch (notifErr: any) {
-      console.error('[Notification Dispatch Warning]', notifErr.message);
+      console.error('[Notification Dispatch Error]', notifErr.message);
     }
 
     return {
       request: requestRecord,
       isDuplicate: false,
       alreadyApproved: false,
+      notificationResult,
     };
   }
 
