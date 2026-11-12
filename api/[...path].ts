@@ -10,7 +10,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // createApp hydrates Firestore once and does not open a listening socket.
     appPromise ??= createApp({ serveFrontend: false });
     const app = await appPromise;
-    return app(req, res);
+    return (app as any)(req as any, res as any);
   } catch (error: any) {
     console.error('[VERCEL API INITIALIZATION ERROR]', error?.message || error);
     appPromise = undefined;
