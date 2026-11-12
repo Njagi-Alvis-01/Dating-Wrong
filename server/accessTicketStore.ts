@@ -14,8 +14,8 @@
  */
 
 import crypto from 'crypto';
-import { db } from './firebaseAdmin.ts';
-import { PaymentStore, BookEntitlementRecord } from './paymentStore.ts';
+import { fsGetDoc, fsSetDoc, fsRunTransaction } from './firestoreAdapter.ts';
+import { BookEntitlementRecord } from './paymentStore.ts';
 
 export interface AccessTicket {
   ticketId: string; // Plain token in memory / during creation
@@ -85,9 +85,8 @@ export class AccessTicketStore {
       singleUse: true,
     };
 
-    // Persist SHA-256 hashed ticket in Firestore
     try {
-      await db.collection('accessTickets').doc(tokenHash).set(ticketDoc);
+      await fsSetDoc('accessTickets', tokenHash, ticketDoc);
       console.log(`[ACCESS TICKET STORED] Persisted SHA-256 hashed reader ticket in Firestore for ${cleanEmail} (Req: ${params.requestId})`);
     } catch (err: any) {
       console.error(`[ACCESS TICKET FIRESTORE WRITE ERROR] Failed to persist ticket in Firestore: ${err.message}`);
@@ -126,23 +125,21 @@ export class AccessTicketStore {
     const tokenHash = this.hashToken(rawTicket);
     const consumedAt = new Date().toISOString();
     const userUid = params.uid || `usr_${requestingEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
-
-    const ticketRef = db.collection('accessTickets').doc(tokenHash);
-    const entRef = db.collection('bookEntitlements').doc(`${userUid}_dating-wrong`);
+    const entDocId = `${userUid}_dating-wrong`;
 
     try {
-      const result = await db.runTransaction(async (transaction) => {
+      const result = await fsRunTransaction(async (transaction) => {
         // --- ALL READS FIRST ---
-        const doc = await transaction.get(ticketRef);
+        const doc = await transaction.getDoc<AccessTicket>('accessTickets', tokenHash);
 
-        if (!doc.exists) {
+        if (!doc.exists || !doc.data) {
           return {
             valid: false,
             reason: 'Invalid or unrecognized access ticket. Please sign in with your authorized Google account.',
           };
         }
 
-        const ticketData = doc.data() as AccessTicket;
+        const ticketData = doc.data;
 
         if (ticketData.type !== 'customer_reader') {
           return {
@@ -176,10 +173,10 @@ export class AccessTicketStore {
           };
         }
 
-        const entitlementDoc = await transaction.get(entRef);
+        const entitlementDoc = await transaction.getDoc<BookEntitlementRecord>('bookEntitlements', entDocId);
 
         // --- ALL WRITES PERFORMED STRICTLY AFTER ALL READS ---
-        transaction.update(ticketRef, {
+        transaction.updateDoc('accessTickets', tokenHash, {
           isConsumed: true,
           consumedAt,
           consumedByEmail: requestingEmail || ticketData.targetEmail,
@@ -187,8 +184,8 @@ export class AccessTicketStore {
         });
 
         let entitlement: BookEntitlementRecord;
-        if (entitlementDoc.exists) {
-          entitlement = entitlementDoc.data() as BookEntitlementRecord;
+        if (entitlementDoc.exists && entitlementDoc.data) {
+          entitlement = entitlementDoc.data;
         } else {
           entitlement = {
             uid: userUid,
@@ -203,7 +200,7 @@ export class AccessTicketStore {
             lastSyncedAt: consumedAt,
             watermark: `Authorized Digital Edition • ${ticketData.targetEmail} • Dating Wrong`,
           };
-          transaction.set(entRef, entitlement);
+          transaction.setDoc('bookEntitlements', entDocId, entitlement);
         }
 
         ticketData.isConsumed = true;
@@ -265,7 +262,7 @@ export class AccessTicketStore {
     };
 
     try {
-      await db.collection('accessTickets').doc(tokenHash).set(ticketDoc);
+      await fsSetDoc('accessTickets', tokenHash, ticketDoc);
       console.log(`[ADMIN TICKET STORED] Persisted SHA-256 hashed admin ticket in Firestore for ${cleanEmail} (Req: ${params.requestId})`);
     } catch (err: any) {
       console.error(`[ADMIN TICKET FIRESTORE WRITE ERROR] Failed to persist ticket in Firestore: ${err.message}`);
@@ -302,21 +299,20 @@ export class AccessTicketStore {
     const tokenHash = this.hashToken(rawTicket);
     const reqEmail = (params.requestingEmail || params.adminEmail || '').trim().toLowerCase();
     const consumedAt = new Date().toISOString();
-    const ticketRef = db.collection('accessTickets').doc(tokenHash);
 
     try {
-      const result = await db.runTransaction(async (transaction) => {
+      const result = await fsRunTransaction(async (transaction) => {
         // --- READS FIRST ---
-        const doc = await transaction.get(ticketRef);
+        const doc = await transaction.getDoc<AccessTicket>('accessTickets', tokenHash);
 
-        if (!doc.exists) {
+        if (!doc.exists || !doc.data) {
           return {
             valid: false,
             reason: 'Invalid or unrecognized administrative access ticket.',
           };
         }
 
-        const ticketData = doc.data() as AccessTicket;
+        const ticketData = doc.data;
 
         if (ticketData.type !== 'admin_review') {
           return {
@@ -351,7 +347,7 @@ export class AccessTicketStore {
         }
 
         // --- WRITES AFTER READS ---
-        transaction.update(ticketRef, {
+        transaction.updateDoc('accessTickets', tokenHash, {
           isConsumed: true,
           consumedAt,
           consumedByEmail: reqEmail || ticketData.targetEmail,
@@ -386,9 +382,9 @@ export class AccessTicketStore {
   static async getTicket(ticketId: string): Promise<AccessTicket | undefined> {
     const tokenHash = this.hashToken(ticketId);
     try {
-      const doc = await db.collection('accessTickets').doc(tokenHash).get();
-      if (doc.exists) {
-        return doc.data() as AccessTicket;
+      const doc = await fsGetDoc<AccessTicket>('accessTickets', tokenHash);
+      if (doc.exists && doc.data) {
+        return doc.data;
       }
     } catch (err: any) {
       console.error(`[ACCESS TICKET GET ERROR] ${err.message}`);

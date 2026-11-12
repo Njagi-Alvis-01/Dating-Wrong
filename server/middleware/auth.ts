@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
-import { adminAuth, db } from '../firebaseAdmin.ts';
+import { adminAuth } from '../firebaseAdmin.ts';
+import { fsGetDoc } from '../firestoreAdapter.ts';
 
 // Explicit 3-administrator allowlist for Dating Wrong
 export const ADMIN_ALLOWLIST = [
@@ -132,9 +133,9 @@ export async function requireAdminAuth(
     // 3. Tertiary: Verify Admin Single-Use Ticket (if passed in header)
     if (ticketHeader) {
       const ticketHash = crypto.createHash('sha256').update(ticketHeader.trim()).digest('hex');
-      const ticketDoc = await db.collection('accessTickets').doc(ticketHash).get();
-      if (ticketDoc.exists) {
-        const data = ticketDoc.data();
+      const ticketDoc = await fsGetDoc<any>('accessTickets', ticketHash);
+      if (ticketDoc.exists && ticketDoc.data) {
+        const data = ticketDoc.data;
         if (data && data.type === 'admin_review' && !data.isConsumed && Date.now() <= new Date(data.expiresAt).getTime()) {
           const email = (data.targetEmail || '').trim().toLowerCase();
           if (ADMIN_ALLOWLIST.includes(email as AdminEmail)) {

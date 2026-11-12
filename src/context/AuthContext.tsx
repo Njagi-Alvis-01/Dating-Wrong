@@ -23,6 +23,7 @@ import {
 } from 'firebase/firestore';
 import { auth, db } from '../services/firebase.ts';
 import { UserEntitlement } from '../types.ts';
+import { authorizedFetch } from '../utils/authorizedFetch.ts';
 import { EntitlementService } from '../services/entitlementService.ts';
 import { DeviceService } from '../services/deviceService.ts';
 
@@ -280,7 +281,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       // 1. Query server backend with current device info (enforces 2-device exemption cap for admins)
       const currentDev = DeviceService.getCurrentDevice();
-      const res = await fetch('/api/entitlements/check', {
+      const res = await authorizedFetch('/api/entitlements/check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

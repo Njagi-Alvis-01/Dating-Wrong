@@ -1,5 +1,6 @@
 import { AuthorizedDevice } from '../types.ts';
 import { getOrCreateDeviceId, detectDeviceDetails } from './offlineStorageService.ts';
+import { authorizedFetch } from '../utils/authorizedFetch.ts';
 
 export const DeviceService = {
   // Get current device ID and metadata
@@ -13,7 +14,7 @@ export const DeviceService = {
   async getAuthorizedDevices(userId: string, email?: string): Promise<{ devices: AuthorizedDevice[]; maxDevices: number }> {
     try {
       const emailQuery = email ? `?email=${encodeURIComponent(email)}` : '';
-      const resp = await fetch(`/api/devices/${encodeURIComponent(userId)}${emailQuery}`);
+      const resp = await authorizedFetch(`/api/devices/${encodeURIComponent(userId)}${emailQuery}`);
       if (!resp.ok) throw new Error('Failed to fetch devices');
       return await resp.json();
     } catch {
@@ -39,7 +40,7 @@ export const DeviceService = {
   // Revoke an old device (freeing up a slot when user changes phones)
   async revokeDevice(userId: string, deviceId: string, email?: string): Promise<boolean> {
     try {
-      const resp = await fetch('/api/devices/revoke', {
+      const resp = await authorizedFetch('/api/devices/revoke', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, deviceId, email }),

@@ -13,7 +13,8 @@ service cloud.firestore {
     function isAdmin() {
       return isAuthenticated() && 
         (
-          (request.auth.token.email != null && (
+          (request.auth.token.email != null &&
+           request.auth.token.email_verified == true && (
             request.auth.token.email == 'alvisnjagi@gmail.com' ||
             request.auth.token.email == 'wanyekigerison@gmail.com' ||
             request.auth.token.email == 'ochiengmark2908@gmail.com'
@@ -35,11 +36,15 @@ service cloud.firestore {
     // Payments Collection
     match /payments/{paymentId} {
       // User can read their own payment records, Admin can read all
-      allow read: if isAuthenticated() && (
-        (resource != null && (
-          resource.data.uid == request.auth.uid || 
-          resource.data.email == request.auth.token.email
-        )) ||
+      allow get: if isAuthenticated() && (
+        resource == null ||
+        resource.data.uid == request.auth.uid ||
+        resource.data.email == request.auth.token.email ||
+        isAdmin()
+      );
+      allow list: if isAuthenticated() && (
+        resource.data.uid == request.auth.uid ||
+        resource.data.email == request.auth.token.email ||
         isAdmin()
       );
       // Client can only create pending checkout requests; status verification happens on backend
@@ -51,11 +56,15 @@ service cloud.firestore {
 
     // Payment Requests Collection (M-PESA Pochi pasted SMS verification requests)
     match /paymentRequests/{requestId} {
-      allow read: if isAuthenticated() && (
-        (resource != null && (
-          resource.data.uid == request.auth.uid || 
-          resource.data.email == request.auth.token.email
-        )) ||
+      allow get: if isAuthenticated() && (
+        resource == null ||
+        resource.data.uid == request.auth.uid ||
+        resource.data.email == request.auth.token.email ||
+        isAdmin()
+      );
+      allow list: if isAuthenticated() && (
+        resource.data.uid == request.auth.uid ||
+        resource.data.email == request.auth.token.email ||
         isAdmin()
       );
       // User creates pending verification request with their attached Google UID
@@ -67,7 +76,7 @@ service cloud.firestore {
 
     // Book Entitlements Collection (indexed by uid_bookId)
     match /bookEntitlements/{entitlementDocId} {
-      allow read: if isAuthenticated() && (
+      allow get: if isAuthenticated() && (
         entitlementDocId.matches('^' + request.auth.uid + '.*') ||
         (resource != null && (
           resource.data.uid == request.auth.uid ||
@@ -76,17 +85,28 @@ service cloud.firestore {
         )) ||
         isAdmin()
       );
+      allow list: if isAuthenticated() && (
+        resource.data.uid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        resource.data.email == request.auth.token.email ||
+        isAdmin()
+      );
       allow write: if isAdmin();
     }
 
     // Entitlements Collection (client sync & query by userId/email)
     match /entitlements/{entitlementId} {
-      allow read: if isAuthenticated() && (
-        (resource != null && (
-          resource.data.userId == request.auth.uid ||
-          resource.data.uid == request.auth.uid ||
-          (resource.data.email != null && resource.data.email == request.auth.token.email)
-        )) ||
+      allow get: if isAuthenticated() && (
+        resource == null ||
+        resource.data.userId == request.auth.uid ||
+        resource.data.uid == request.auth.uid ||
+        resource.data.email == request.auth.token.email ||
+        isAdmin()
+      );
+      allow list: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        resource.data.uid == request.auth.uid ||
+        resource.data.email == request.auth.token.email ||
         isAdmin()
       );
       allow create, update: if isAuthenticated() && (
@@ -105,12 +125,19 @@ service cloud.firestore {
 
     // Devices Collection (Section 29: Authorized Offline Devices)
     match /devices/{deviceId} {
-      allow read: if isAuthenticated() && (
-        (resource != null && resource.data.userId == request.auth.uid) || 
+      allow get: if isAuthenticated() && (
+        resource == null ||
+        resource.data.userId == request.auth.uid ||
         isAdmin()
       );
-      allow create: if isAuthenticated() && 
-        request.resource.data.userId == request.auth.uid;
+      allow list: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid ||
+        isAdmin()
+      );
       allow update: if isAuthenticated() && (
         (resource != null && resource.data.userId == request.auth.uid) || 
         isAdmin()
@@ -121,10 +148,74 @@ service cloud.firestore {
       );
     }
 
+    // Reading Progress Collection (uid_bookId)
+    match /readingProgress/{progressId} {
+      allow get: if isAuthenticated() && (
+        progressId.matches('^' + request.auth.uid + '_.*') ||
+        (resource != null && resource.data.uid == request.auth.uid) ||
+        isAdmin()
+      );
+      allow list: if isAuthenticated() && (
+        resource.data.uid == request.auth.uid ||
+        isAdmin()
+      );
+      allow create, update: if isAuthenticated() && (
+        (progressId.matches('^' + request.auth.uid + '_.*') &&
+         request.resource.data.uid == request.auth.uid) ||
+        isAdmin()
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Bookmarks Collection (uid_bookId)
+    match /bookmarks/{bookmarkId} {
+      allow get: if isAuthenticated() && (
+        bookmarkId.matches('^' + request.auth.uid + '_.*') ||
+        (resource != null && resource.data.uid == request.auth.uid) ||
+        isAdmin()
+      );
+      allow list: if isAuthenticated() && (
+        resource.data.uid == request.auth.uid ||
+        isAdmin()
+      );
+      allow create, update: if isAuthenticated() && (
+        (bookmarkId.matches('^' + request.auth.uid + '_.*') &&
+         request.resource.data.uid == request.auth.uid) ||
+        isAdmin()
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Access Tickets Collection (Single-use cryptographic nonces, hashed by SHA-256)
+    match /accessTickets/{tokenHash} {
+      allow list: if isAdmin();
+      allow get: if isAdmin() || (
+        isAuthenticated() &&
+        resource != null &&
+        resource.data.type == 'customer_reader' &&
+        resource.data.targetEmail == request.auth.token.email
+      );
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        isAuthenticated() &&
+        resource != null &&
+        resource.data.type == 'customer_reader' &&
+        resource.data.targetEmail == request.auth.token.email &&
+        resource.data.isConsumed == false &&
+        request.resource.data.isConsumed == true &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isConsumed', 'consumedAt', 'consumedByEmail', 'consumedByUid'])
+      );
+    }
+
     // Offline Licenses Collection (Cryptographically signed offline leases)
     match /offlineLicenses/{licenseId} {
-      allow read: if isAuthenticated() && (
-        (resource != null && resource.data.userId == request.auth.uid) || 
+      allow get: if isAuthenticated() && (
+        resource == null ||
+        resource.data.userId == request.auth.uid ||
+        isAdmin()
+      );
+      allow list: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
         isAdmin()
       );
       allow write: if isAdmin();

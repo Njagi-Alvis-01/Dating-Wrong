@@ -18,6 +18,7 @@ import { ReaderView } from './components/ReaderView.tsx';
 import { Footer } from './components/Footer.tsx';
 import { WifiOff, ShieldAlert } from 'lucide-react';
 import { OfflineStorageService } from './services/offlineStorageService.ts';
+import { authorizedFetch } from './utils/authorizedFetch.ts';
 
 function DatingWrongApp() {
   const { currentUser, userProfile, entitlement, bookConfig, checkAndRestoreEmailAccess } = useAuth();
@@ -68,7 +69,7 @@ function DatingWrongApp() {
       // 1. Handle Admin Access with Single-Use OTP Nonce
       if (isAdminQuery || tabQuery === 'pochi_approvals' || reqId) {
         if (ticketParam) {
-          fetch('/api/access-tickets/verify-admin', {
+          authorizedFetch('/api/access-tickets/verify-admin', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -132,7 +133,7 @@ function DatingWrongApp() {
 
         if (ticketParam) {
           // Customer is redeeming a single-use cryptographic reader ticket (burn on redemption)
-          fetch('/api/access-tickets/consume-reader', {
+          authorizedFetch('/api/access-tickets/consume-reader', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({

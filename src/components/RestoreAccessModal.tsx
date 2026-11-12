@@ -16,6 +16,7 @@ import { UserEntitlement } from '../types.ts';
 import { useAuth } from '../context/AuthContext.tsx';
 import { parseMpesaSms } from '../utils/mpesaSmsParser.ts';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock.ts';
+import { authorizedFetch } from '../utils/authorizedFetch.ts';
 
 interface RestoreAccessModalProps {
   isOpen: boolean;
@@ -102,7 +103,7 @@ export const RestoreAccessModal: React.FC<RestoreAccessModalProps> = ({
 
     try {
       // Query database of approved accounts via backend endpoint
-      const res = await fetch('/api/payments/pochi/restore-by-sms', {
+      const res = await authorizedFetch('/api/payments/pochi/restore-by-sms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

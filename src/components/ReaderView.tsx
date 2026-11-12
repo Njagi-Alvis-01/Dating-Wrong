@@ -23,6 +23,7 @@ import {
   BookPage,
 } from '../types.ts';
 import { BookManager } from '../data/bookRegistry.ts';
+import { authorizedFetch } from '../utils/authorizedFetch.ts';
 import { generateBookPages } from '../services/bookPageEngine.ts';
 import { BookPageItem } from './BookPageItem.tsx';
 import { OfflineStorageService } from '../services/offlineStorageService.ts';
@@ -135,7 +136,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   useEffect(() => {
     if (!entitlement?.userId) return;
 
-    fetch(`/api/reading-progress/${entitlement.userId}/dating-wrong`)
+    authorizedFetch(`/api/reading-progress/${entitlement.userId}/dating-wrong`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data && data.currentPage && data.currentPage > 1 && !initialSectionId) {
@@ -146,7 +147,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       })
       .catch(() => {});
 
-    fetch(`/api/bookmarks/${entitlement.userId}/dating-wrong`)
+    authorizedFetch(`/api/bookmarks/${entitlement.userId}/dating-wrong`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data && Array.isArray(data.bookmarks) && data.bookmarks.length > 0) {
@@ -205,7 +206,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             // Record reading progress quietly
             EntitlementService.saveReadingProgress(page.sectionId, progress, page.sectionId);
             if (entitlement?.userId) {
-              fetch('/api/reading-progress', {
+              authorizedFetch('/api/reading-progress', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -304,7 +305,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     if (exists) {
       setBookmarks(bookmarks.filter((b) => b.pageNumber !== pageNumber));
       if (entitlement?.userId) {
-        fetch(`/api/bookmarks/${entitlement.userId}/dating-wrong/${pageNumber}`, { method: 'DELETE' }).catch(() => {});
+        authorizedFetch(`/api/bookmarks/${entitlement.userId}/dating-wrong/${pageNumber}`, { method: 'DELETE' }).catch(() => {});
       }
     } else {
       setBookmarks([
@@ -317,7 +318,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         },
       ]);
       if (entitlement?.userId) {
-        fetch('/api/bookmarks', {
+        authorizedFetch('/api/bookmarks', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

@@ -35,6 +35,7 @@ import { useAuth } from '../context/AuthContext.tsx';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock.ts';
 import { doc, collection, onSnapshot, setDoc, deleteDoc, getDocs, query, where, serverTimestamp, addDoc, orderBy, limit } from 'firebase/firestore';
 import { db } from '../services/firebase.ts';
+import { authorizedFetch } from '../utils/authorizedFetch.ts';
 
 export interface AuthorizedAdmin {
   email: string;
@@ -565,7 +566,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
         setTotalMappedUsers(approved.length);
       }
 
-      const res = await fetch('/api/admin/mapped-users', { headers: adminHeaders });
+      const res = await authorizedFetch('/api/admin/mapped-users', { headers: adminHeaders });
       if (res.ok) {
         const data = await res.json();
         if (data.users && data.users.length > 0) {
@@ -580,7 +581,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
 
   const fetchNotificationToggle = async () => {
     try {
-      const res = await fetch('/api/admin/notifications/toggle', { headers: adminHeaders });
+      const res = await authorizedFetch('/api/admin/notifications/toggle', { headers: adminHeaders });
       if (res.ok) {
         const data = await res.json();
         setNotificationsEnabled(Boolean(data.pendingApprovalsNotificationsEnabled));
@@ -594,7 +595,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
     setTogglingNotifs(true);
     try {
       const nextState = !notificationsEnabled;
-      const res = await fetch('/api/admin/notifications/toggle', {
+      const res = await authorizedFetch('/api/admin/notifications/toggle', {
         method: 'POST',
         headers: adminHeaders,
         body: JSON.stringify({ enabled: nextState }),
@@ -687,7 +688,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
       }
 
       // 2. Also query backend API
-      const res = await fetch('/api/admin/payment-requests', { headers: adminHeaders });
+      const res = await authorizedFetch('/api/admin/payment-requests', { headers: adminHeaders });
       if (res.ok) {
         const data = await res.json();
         if (data.requests && data.requests.length > 0) {
@@ -708,7 +709,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
     setSuccessMsg(null);
     const approvingEmail = activeAdminEmail.trim().toLowerCase();
     try {
-      const res = await fetch(`/api/admin/payment-requests/${requestId}/approve`, {
+      const res = await authorizedFetch(`/api/admin/payment-requests/${requestId}/approve`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -830,7 +831,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
     setSuccessMsg(null);
     const rejectingEmail = activeAdminEmail.trim().toLowerCase();
     try {
-      const res = await fetch(`/api/admin/payment-requests/${requestId}/reject`, {
+      const res = await authorizedFetch(`/api/admin/payment-requests/${requestId}/reject`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -897,7 +898,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
     setIsReassigning(true);
     const cleanEmail = newApproverEmail.trim().toLowerCase();
     try {
-      const res = await fetch(`/api/admin/payment-requests/${requestId}/reassign-approver`, {
+      const res = await authorizedFetch(`/api/admin/payment-requests/${requestId}/reassign-approver`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -961,7 +962,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
 
     try {
       // 1. Purge from server memory and backend records
-      const res = await fetch('/api/admin/users/delete', {
+      const res = await authorizedFetch('/api/admin/users/delete', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1070,7 +1071,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
 
   const fetchOverviewStats = async () => {
     try {
-      const res = await fetch('/api/admin/stats', { headers: adminHeaders });
+      const res = await authorizedFetch('/api/admin/stats', { headers: adminHeaders });
       if (res.ok) {
         const data = await res.json();
         setStats(data);
@@ -1083,7 +1084,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
   const fetchPayments = async () => {
     setIsLoading(true);
     try {
-      const res = await fetch('/api/admin/payments');
+      const res = await authorizedFetch('/api/admin/payments', { headers: adminHeaders });
       if (res.ok) {
         const data = await res.json();
         setPaymentsList(data.payments || []);
@@ -1097,7 +1098,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
 
   const fetchSmsLogs = async () => {
     try {
-      const res = await fetch('/api/admin/sms-logs', { headers: adminHeaders });
+      const res = await authorizedFetch('/api/admin/sms-logs', { headers: adminHeaders });
       if (res.ok) {
         const data = await res.json();
         setSmsLogs(data.logs || []);
@@ -1109,7 +1110,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
 
   const fetchEmailLogs = async () => {
     try {
-      const res = await fetch('/api/admin/email-logs', { headers: adminHeaders });
+      const res = await authorizedFetch('/api/admin/email-logs', { headers: adminHeaders });
       if (res.ok) {
         const data = await res.json();
         setEmailLogs(data.logs || []);
@@ -1135,7 +1136,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
       });
 
       // 2. Sync to Server payment store
-      await fetch('/api/admin/book-config', {
+      await authorizedFetch('/api/admin/book-config', {
         method: 'POST',
         headers: adminHeaders,
         body: JSON.stringify({
@@ -1176,7 +1177,7 @@ export const AdminDashboardModal: React.FC<AdminDashboardModalProps> = ({
   const handleReconcilePayment = async (paymentSessionId: string) => {
     setReconcilingId(paymentSessionId);
     try {
-      const res = await fetch(`/api/payments/mpesa/reconcile/${paymentSessionId}`, {
+      const res = await authorizedFetch(`/api/payments/mpesa/reconcile/${paymentSessionId}`, {
         method: 'POST',
         headers: adminHeaders,
       });

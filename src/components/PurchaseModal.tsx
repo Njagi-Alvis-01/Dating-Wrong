@@ -23,6 +23,7 @@ import { useAuth } from '../context/AuthContext.tsx';
 import { parseMpesaSms } from '../utils/mpesaSmsParser.ts';
 import { doc, setDoc, serverTimestamp, onSnapshot } from 'firebase/firestore';
 import { db } from '../services/firebase.ts';
+import { authorizedFetch } from '../utils/authorizedFetch.ts';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock.ts';
 
 interface PurchaseModalProps {
@@ -190,7 +191,7 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
           }
 
           // Check if user already has a pending Pochi request
-          fetch(`/api/payments/pochi/user-requests?uid=${currentUser.uid}&email=${encodeURIComponent(currentUser.email!)}`)
+          authorizedFetch(`/api/payments/pochi/user-requests?uid=${currentUser.uid}&email=${encodeURIComponent(currentUser.email!)}`)
             .then((res) => (res.ok ? res.json() : null))
             .then((data) => {
               if (data?.requests && data.requests.length > 0) {
@@ -290,7 +291,7 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
   const checkRequestStatus = async (requestId: string) => {
     setPollCount((prev) => prev + 1);
     try {
-      const res = await fetch(`/api/payments/pochi/request-status/${requestId}`);
+      const res = await authorizedFetch(`/api/payments/pochi/request-status/${requestId}`);
       if (res.ok) {
         const data = await res.json();
         if (data.status === 'APPROVED') {
@@ -328,7 +329,7 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
     setRedirectNotice(null);
 
     try {
-      const res = await fetch(`/api/payments/pochi/request-status/${requestId}`);
+      const res = await authorizedFetch(`/api/payments/pochi/request-status/${requestId}`);
       if (res.ok) {
         const data = await res.json();
         if (data.status === 'APPROVED') {
@@ -541,7 +542,7 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
     setIsSubmittingSms(true);
 
     try {
-      const res = await fetch('/api/payments/pochi/submit-sms', {
+      const res = await authorizedFetch('/api/payments/pochi/submit-sms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

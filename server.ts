@@ -8,6 +8,8 @@ import { NotificationService } from './server/notificationService.ts';
 import { EmailConfirmationService } from './server/emailConfirmationService.ts';
 import { AccessTicketStore } from './server/accessTicketStore.ts';
 import { requireAdminAuth, generateAdminSessionToken, ADMIN_ALLOWLIST } from './server/middleware/auth.ts';
+import { adminAuth } from './server/firebaseAdmin.ts';
+import { runWithRequestAuth, isUnauthenticatedPermissionError } from './server/firestoreAdapter.ts';
 import { verifyPastedMpesaSms } from './src/utils/mpesaSmsParser.ts';
 import { normalizeKenyanPhone } from './src/utils/phoneNormalization.ts';
 
@@ -41,6 +43,30 @@ async function startServer() {
   });
 
   app.use(express.json());
+
+  // Verify caller Firebase ID Token (when provided) and bind to request AsyncLocalStorage
+  app.use(async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const idToken = authHeader.substring(7).trim();
+      if (idToken) {
+        try {
+          const decoded = await adminAuth.verifyIdToken(idToken);
+          return runWithRequestAuth(
+            {
+              uid: decoded.uid,
+              email: (decoded.email || '').trim().toLowerCase(),
+              idToken,
+            },
+            () => next()
+          );
+        } catch {
+          // Invalid/expired token — continue without authenticated Firestore context
+        }
+      }
+    }
+    return runWithRequestAuth({}, () => next());
+  });
 
   // Automatically detect and configure active Base URL for notification alerts & reader links
   app.use((req, res, next) => {
@@ -684,6 +710,9 @@ async function startServer() {
         entitlement,
       });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ success: false, error: 'Authentication required to check payment status.' });
+      }
       console.error('[POCHI REQUEST STATUS ERROR]', err.message);
       res.status(500).json({ success: false, error: 'Failed to retrieve payment request status' });
     }
@@ -705,6 +734,9 @@ async function startServer() {
         requests,
       });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ success: false, error: 'Authentication required to retrieve payment requests.' });
+      }
       console.error('[POCHI USER REQUESTS ERROR]', err.message);
       res.status(500).json({ error: 'Failed to retrieve payment requests' });
     }
@@ -749,6 +781,14 @@ async function startServer() {
         });
       }
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({
+          success: false,
+          approved: false,
+          redirectToBuy: false,
+          error: 'Please sign in with Google to restore access.',
+        });
+      }
       console.error('[RESTORE BY SMS ERROR]', err.message);
       res.status(500).json({
         success: false,
@@ -802,6 +842,9 @@ async function startServer() {
         authorized: false,
       });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ authorized: false, error: 'Authentication required to verify entitlement.' });
+      }
       console.error('[ENTITLEMENT CHECK ERROR]', err.message);
       res.status(500).json({ error: 'Service error checking entitlement.' });
     }
@@ -827,6 +870,9 @@ async function startServer() {
         maxDevices: isAdmin ? 2 : 3,
       });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ error: 'Authentication required to retrieve devices.' });
+      }
       console.error('[GET DEVICES ERROR]', err.message);
       res.status(500).json({ error: 'Failed to retrieve devices' });
     }
@@ -876,6 +922,9 @@ async function startServer() {
         maxDevices: isAdmin ? 2 : 3,
       });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ error: 'Authentication required to authorize device.' });
+      }
       console.error('[AUTHORIZE DEVICE ERROR]', err.message);
       res.status(500).json({ error: 'Failed to authorize device' });
     }
@@ -911,6 +960,9 @@ async function startServer() {
         activeDevices,
       });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ error: 'Authentication required to revoke device.' });
+      }
       console.error('[REVOKE DEVICE ERROR]', err.message);
       res.status(500).json({ error: 'Failed to revoke device' });
     }
@@ -1027,8 +1079,8 @@ async function startServer() {
     }
   });
 
-  // Section 36: Transaction Status & Reconciliation Mechanism
-  app.post('/api/payments/mpesa/reconcile/:paymentSessionId', async (req, res) => {
+  // Section 36: Transaction Status & Reconciliation Mechanism (Admin only)
+  app.post('/api/payments/mpesa/reconcile/:paymentSessionId', requireAdminAuth, async (req, res) => {
     const { paymentSessionId } = req.params;
     try {
       const result = await PaymentStore.reconcilePaymentSession(paymentSessionId);
@@ -1051,6 +1103,9 @@ async function startServer() {
       const progress = await PaymentStore.getReadingProgress(uid, bookId);
       res.json(progress || { uid, bookId, currentPage: 1, percentage: 0, lastReadAt: null });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ error: 'Authentication required to retrieve reading progress.' });
+      }
       console.error('[GET PROGRESS ERROR]', err.message);
       res.status(500).json({ error: 'Failed to retrieve reading progress' });
     }
@@ -1070,6 +1125,9 @@ async function startServer() {
       });
       res.json({ success: true, progress: saved });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ error: 'Authentication required to save reading progress.' });
+      }
       console.error('[SAVE PROGRESS ERROR]', err.message);
       res.status(500).json({ error: 'Failed to save reading progress' });
     }
@@ -1082,6 +1140,9 @@ async function startServer() {
       const bookmarks = await PaymentStore.getBookmarks(uid, bookId);
       res.json({ bookmarks });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ error: 'Authentication required to retrieve bookmarks.' });
+      }
       console.error('[GET BOOKMARKS ERROR]', err.message);
       res.status(500).json({ error: 'Failed to retrieve bookmarks' });
     }
@@ -1101,6 +1162,9 @@ async function startServer() {
       });
       res.json({ success: true, bookmarks: updated });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ error: 'Authentication required to save bookmark.' });
+      }
       console.error('[SAVE BOOKMARK ERROR]', err.message);
       res.status(500).json({ error: 'Failed to save bookmark' });
     }
@@ -1112,6 +1176,9 @@ async function startServer() {
       const updated = await PaymentStore.deleteBookmark(uid, bookId, Number(page));
       res.json({ success: true, bookmarks: updated });
     } catch (err: any) {
+      if (isUnauthenticatedPermissionError(err)) {
+        return res.status(401).json({ error: 'Authentication required to delete bookmark.' });
+      }
       console.error('[DELETE BOOKMARK ERROR]', err.message);
       res.status(500).json({ error: 'Failed to delete bookmark' });
     }

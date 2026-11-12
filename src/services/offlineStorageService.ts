@@ -9,6 +9,7 @@ import {
   TokenVerificationResult,
   EncryptedOfflineBookRecord,
 } from '../types.ts';
+import { authorizedFetch } from '../utils/authorizedFetch.ts';
 
 const DB_NAME = 'DatingWrong_SecureOffline_v2';
 const DB_VERSION = 2;
@@ -637,7 +638,7 @@ export const OfflineStorageService = {
 
     // Step 7: Notify server of device authorization in background if online
     try {
-      fetch('/api/devices/authorize', {
+      authorizedFetch('/api/devices/authorize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -889,7 +890,7 @@ export const OfflineStorageService = {
     if (!license) return { valid: false };
 
     try {
-      const resp = await fetch('/api/devices/verify-license', {
+      const resp = await authorizedFetch('/api/devices/verify-license', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

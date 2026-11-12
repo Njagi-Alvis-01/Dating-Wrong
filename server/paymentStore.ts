@@ -29,7 +29,17 @@ import { normalizeKenyanPhone, arePhonesEqual } from '../src/utils/phoneNormaliz
 import { NotificationService } from './notificationService.ts';
 import { EmailConfirmationService } from './emailConfirmationService.ts';
 import { parseMpesaSms } from '../src/utils/mpesaSmsParser.ts';
-import { db } from './firebaseAdmin.ts';
+import {
+  fsGetDoc,
+  fsSetDoc,
+  fsUpdateDoc,
+  fsQuery,
+  fsBatchCommit,
+  fsRunTransaction,
+  BatchWriteOp,
+  getRequestAuth,
+  isUnauthenticatedPermissionError,
+} from './firestoreAdapter.ts';
 
 export type PaymentStatus =
   | 'CREATED'
@@ -230,16 +240,16 @@ export class PaymentStore {
    */
   static async initFromFirestore(): Promise<void> {
     try {
-      const paySnap = await db.collection('payments').limit(100).get();
-      paySnap.forEach((doc) => {
-        const data = doc.data() as PaymentRecord;
+      const docs = await fsQuery<PaymentRecord>('payments', [], { limit: 100 });
+      for (const d of docs) {
+        const data = d.data;
         if (data && data.paymentId) {
           this.payments.set(data.paymentId, data);
           if (data.checkoutRequestId) {
             this.checkoutSessionIndex.set(data.checkoutRequestId, data.paymentId);
           }
         }
-      });
+      }
       console.log(`[FIRESTORE SYNC] Hydrated server payment session indices from Firestore.`);
     } catch (err: any) {
       console.warn(`[FIRESTORE HYDRATE NOTICE] ${err.message}`);
@@ -299,7 +309,7 @@ export class PaymentStore {
     }
 
     try {
-      await db.collection('payments').doc(paymentId).set(record);
+      await fsSetDoc('payments', paymentId, record);
     } catch (err: any) {
       console.error(`[PAYMENT FIRESTORE WRITE ERROR] ${err.message}`);
       throw new Error(`Failed to persist payment session: ${err.message}`);
@@ -313,9 +323,9 @@ export class PaymentStore {
       return this.payments.get(paymentId)!;
     }
     try {
-      const snap = await db.collection('payments').doc(paymentId).get();
-      if (snap.exists) {
-        const p = snap.data() as PaymentRecord;
+      const snap = await fsGetDoc<PaymentRecord>('payments', paymentId);
+      if (snap.exists && snap.data) {
+        const p = snap.data;
         this.payments.set(paymentId, p);
         return p;
       }
@@ -332,9 +342,13 @@ export class PaymentStore {
       return this.payments.get(paymentId)!;
     }
     try {
-      const snap = await db.collection('payments').where('checkoutRequestId', '==', checkoutRequestId).limit(1).get();
-      if (!snap.empty) {
-        const p = snap.docs[0].data() as PaymentRecord;
+      const docs = await fsQuery<PaymentRecord>(
+        'payments',
+        [{ field: 'checkoutRequestId', op: '==', value: checkoutRequestId }],
+        { limit: 1 }
+      );
+      if (docs.length > 0) {
+        const p = docs[0].data;
         this.payments.set(p.paymentId, p);
         this.checkoutSessionIndex.set(checkoutRequestId, p.paymentId);
         return p;
@@ -353,12 +367,14 @@ export class PaymentStore {
   static async getEntitlement(uid: string, bookId: string = 'dating-wrong'): Promise<BookEntitlementRecord | null> {
     const docId = `${uid}_${bookId}`;
     try {
-      const snap = await db.collection('bookEntitlements').doc(docId).get();
-      if (snap.exists) {
-        return snap.data() as BookEntitlementRecord;
+      const snap = await fsGetDoc<BookEntitlementRecord>('bookEntitlements', docId);
+      if (snap.exists && snap.data) {
+        return snap.data;
       }
     } catch (err: any) {
-      console.error(`[FIRESTORE ENTITLEMENT READ ERROR for ${docId}]: ${err.message}`);
+      if (!isUnauthenticatedPermissionError(err)) {
+        console.error(`[FIRESTORE ENTITLEMENT READ ERROR for ${docId}]: ${err.message}`);
+      }
       throw err; // Fail closed
     }
     return null;
@@ -367,7 +383,7 @@ export class PaymentStore {
   static async setEntitlement(record: BookEntitlementRecord): Promise<void> {
     const docId = `${record.uid}_${record.bookId}`;
     try {
-      await db.collection('bookEntitlements').doc(docId).set(record, { merge: true });
+      await fsSetDoc('bookEntitlements', docId, record, { merge: true });
     } catch (err: any) {
       console.error(`[FIRESTORE ENTITLEMENT WRITE ERROR for ${docId}]: ${err.message}`);
       throw err;
@@ -402,8 +418,9 @@ export class PaymentStore {
       'ochiengmark2908@gmail.com',
     ];
     const isAdmin = adminEmails.includes(cleanEmail);
+    const authCtx = getRequestAuth();
 
-    if (isAdmin) {
+    if (isAdmin && authCtx?.idToken && authCtx.email === cleanEmail) {
       const adminKey = `admin_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
       const now = new Date().toISOString();
 
@@ -444,7 +461,7 @@ export class PaymentStore {
           lastSeenAt: now,
           status: 'active',
         };
-        await db.collection('devices').doc(newDevId).set(newDev);
+        await fsSetDoc('devices', newDevId, newDev);
 
         const updatedActive = [...activeDevices, newDev];
         const adminEnt: BookEntitlementRecord = {
@@ -475,6 +492,9 @@ export class PaymentStore {
           devices: activeDevices,
         };
       }
+    } else if (isAdmin) {
+      // Do not issue an admin exemption pass without a matching verified Firebase ID token
+      return {};
     }
 
     // Regular reader check
@@ -500,15 +520,14 @@ export class PaymentStore {
 
       // Check approved payment requests in Firestore
       try {
-        const reqSnap = await db
-          .collection('paymentRequests')
-          .where('email', '==', cleanEmail)
-          .where('status', '==', 'APPROVED')
-          .limit(1)
-          .get();
+        const reqDocs = await fsQuery<PaymentRequestRecord>(
+          'paymentRequests',
+          [{ field: 'email', op: '==', value: cleanEmail }]
+        );
+        const approvedReq = reqDocs.find((d) => d.data.status === 'APPROVED');
 
-        if (!reqSnap.empty) {
-          const req = reqSnap.docs[0].data() as PaymentRequestRecord;
+        if (approvedReq) {
+          const req = approvedReq.data;
           const ent = await this.getEntitlement(req.uid, bookId);
           if (ent) return ent;
 
@@ -542,9 +561,9 @@ export class PaymentStore {
     const norm = normalizeTransactionCode(code);
     if (!norm) return null;
     try {
-      const doc = await db.collection('usedTransactions').doc(norm).get();
-      if (doc.exists) {
-        return doc.data() as UsedTransactionRecord;
+      const doc = await fsGetDoc<UsedTransactionRecord>('usedTransactions', norm);
+      if (doc.exists && doc.data) {
+        return doc.data;
       }
     } catch (err: any) {
       console.error(`[FIRESTORE GET USED TRANSACTION ERROR]: ${err.message}`);
@@ -555,10 +574,11 @@ export class PaymentStore {
 
   static async getAllPayments(): Promise<PaymentRecord[]> {
     try {
-      const snap = await db.collection('payments').orderBy('createdAt', 'desc').limit(200).get();
-      const list: PaymentRecord[] = [];
-      snap.forEach((doc) => list.push(doc.data() as PaymentRecord));
-      return list;
+      const docs = await fsQuery<PaymentRecord>('payments', [], {
+        orderBy: { field: 'createdAt', direction: 'desc' },
+        limit: 200,
+      });
+      return docs.map((d) => d.data);
     } catch (err: any) {
       console.error(`[FIRESTORE GET ALL PAYMENTS ERROR]: ${err.message}`);
       return Array.from(this.payments.values());
@@ -663,9 +683,10 @@ export class PaymentStore {
     };
 
     // Commit to Firestore atomically
-    const batch = db.batch();
-    batch.set(db.collection('usedTransactions').doc(code), usedRecord);
-    batch.set(db.collection('bookEntitlements').doc(`${params.uid}_dating-wrong`), entitlement);
+    const ops: BatchWriteOp[] = [
+      { type: 'set', col: 'usedTransactions', docId: code, data: usedRecord },
+      { type: 'set', col: 'bookEntitlements', docId: `${params.uid}_dating-wrong`, data: entitlement },
+    ];
 
     if (payment) {
       payment.status = 'VERIFIED';
@@ -674,10 +695,10 @@ export class PaymentStore {
       payment.verifiedAt = now;
       payment.updatedAt = now;
       payment.securityChecksPassed = true;
-      batch.set(db.collection('payments').doc(payment.paymentId), payment, { merge: true });
+      ops.push({ type: 'set', col: 'payments', docId: payment.paymentId, data: payment, merge: true });
     }
 
-    await batch.commit();
+    await fsBatchCommit(ops);
 
     return {
       passed: true,
@@ -746,7 +767,7 @@ export class PaymentStore {
       payment.receivedAmount = params.amountReceived;
       payment.transactionCode = params.transactionCode;
       payment.updatedAt = now;
-      db.collection('payments').doc(payment.paymentId).set(payment, { merge: true }).catch(() => {});
+      fsSetDoc('payments', payment.paymentId, payment, { merge: true }).catch(() => {});
     }
 
     return {
@@ -760,12 +781,14 @@ export class PaymentStore {
   // --- Devices Store ---
   static async getUserDevices(userId: string): Promise<StoredAuthorizedDevice[]> {
     try {
-      const snap = await db.collection('devices').where('userId', '==', userId).get();
-      const list: StoredAuthorizedDevice[] = [];
-      snap.forEach((doc) => list.push(doc.data() as StoredAuthorizedDevice));
-      return list;
+      const docs = await fsQuery<StoredAuthorizedDevice>('devices', [
+        { field: 'userId', op: '==', value: userId },
+      ]);
+      return docs.map((d) => d.data);
     } catch (err: any) {
-      console.error(`[FIRESTORE GET USER DEVICES ERROR]: ${err.message}`);
+      if (!isUnauthenticatedPermissionError(err)) {
+        console.error(`[FIRESTORE GET USER DEVICES ERROR]: ${err.message}`);
+      }
       throw err;
     }
   }
@@ -785,7 +808,7 @@ export class PaymentStore {
       existing.lastSeenAt = now;
       existing.deviceName = params.deviceName;
       existing.status = 'active';
-      await db.collection('devices').doc(params.deviceId).set(existing, { merge: true });
+      await fsSetDoc('devices', params.deviceId, existing, { merge: true });
       return { success: true, device: existing, devices: list.filter((d) => d.status === 'active') };
     }
 
@@ -814,16 +837,15 @@ export class PaymentStore {
       status: 'active',
     };
 
-    await db.collection('devices').doc(params.deviceId).set(newDevice);
+    await fsSetDoc('devices', params.deviceId, newDevice);
     return { success: true, device: newDevice, devices: [...activeDevices, newDevice] };
   }
 
   static async revokeDevice(userId: string, deviceId: string): Promise<boolean> {
     try {
-      const docRef = db.collection('devices').doc(deviceId);
-      const snap = await docRef.get();
+      const snap = await fsGetDoc<StoredAuthorizedDevice>('devices', deviceId);
       if (snap.exists) {
-        await docRef.update({ status: 'revoked', lastSeenAt: new Date().toISOString() });
+        await fsUpdateDoc('devices', deviceId, { status: 'revoked', lastSeenAt: new Date().toISOString() });
         return true;
       }
     } catch (err: any) {
@@ -836,9 +858,9 @@ export class PaymentStore {
   // --- Reading Progress ---
   static async getReadingProgress(uid: string, bookId: string = 'dating-wrong'): Promise<StoredReadingProgress | null> {
     try {
-      const snap = await db.collection('readingProgress').doc(`${uid}_${bookId}`).get();
-      if (snap.exists) {
-        return snap.data() as StoredReadingProgress;
+      const snap = await fsGetDoc<StoredReadingProgress>('readingProgress', `${uid}_${bookId}`);
+      if (snap.exists && snap.data) {
+        return snap.data;
       }
     } catch (err: any) {
       console.error(`[FIRESTORE GET READING PROGRESS ERROR]: ${err.message}`);
@@ -862,7 +884,7 @@ export class PaymentStore {
       lastReadAt: new Date().toISOString(),
     };
     try {
-      await db.collection('readingProgress').doc(docId).set(record, { merge: true });
+      await fsSetDoc('readingProgress', docId, record, { merge: true });
     } catch (err: any) {
       console.error(`[FIRESTORE SAVE READING PROGRESS ERROR]: ${err.message}`);
       throw err;
@@ -873,10 +895,9 @@ export class PaymentStore {
   // --- Bookmarks ---
   static async getBookmarks(uid: string, bookId: string = 'dating-wrong'): Promise<StoredBookmark[]> {
     try {
-      const snap = await db.collection('bookmarks').doc(`${uid}_${bookId}`).get();
-      if (snap.exists) {
-        const data = snap.data();
-        return (data?.items as StoredBookmark[]) || [];
+      const snap = await fsGetDoc<{ uid?: string; items?: StoredBookmark[] }>('bookmarks', `${uid}_${bookId}`);
+      if (snap.exists && snap.data) {
+        return snap.data.items || [];
       }
     } catch (err: any) {
       console.error(`[FIRESTORE GET BOOKMARKS ERROR]: ${err.message}`);
@@ -892,7 +913,7 @@ export class PaymentStore {
       const filtered = list.filter((b) => b.page !== bookmark.page);
       filtered.push(bookmark);
       filtered.sort((a, b) => a.page - b.page);
-      await db.collection('bookmarks').doc(docId).set({ items: filtered }, { merge: true });
+      await fsSetDoc('bookmarks', docId, { uid, bookId, items: filtered }, { merge: true });
       return filtered;
     } catch (err: any) {
       console.error(`[FIRESTORE SAVE BOOKMARK ERROR]: ${err.message}`);
@@ -905,7 +926,7 @@ export class PaymentStore {
     try {
       const list = await this.getBookmarks(uid, bookId);
       const filtered = list.filter((b) => b.page !== page);
-      await db.collection('bookmarks').doc(docId).set({ items: filtered }, { merge: true });
+      await fsSetDoc('bookmarks', docId, { uid, bookId, items: filtered }, { merge: true });
       return filtered;
     } catch (err: any) {
       console.error(`[FIRESTORE DELETE BOOKMARK ERROR]: ${err.message}`);
@@ -998,10 +1019,10 @@ export class PaymentStore {
     };
 
     // Atomically persist to Firestore
-    const batch = db.batch();
-    batch.set(db.collection('paymentRequests').doc(requestId), requestRecord);
-    batch.set(db.collection('payments').doc(paymentId), paymentRecord);
-    await batch.commit();
+    await fsBatchCommit([
+      { type: 'set', col: 'paymentRequests', docId: requestId, data: requestRecord },
+      { type: 'set', col: 'payments', docId: paymentId, data: paymentRecord },
+    ]);
 
     // Dispatch notifications to all 3 Administrators
     try {
@@ -1033,10 +1054,11 @@ export class PaymentStore {
 
   static async getAllPaymentRequests(): Promise<PaymentRequestRecord[]> {
     try {
-      const snap = await db.collection('paymentRequests').orderBy('submittedAt', 'desc').limit(200).get();
-      const list: PaymentRequestRecord[] = [];
-      snap.forEach((doc) => list.push(doc.data() as PaymentRequestRecord));
-      return list;
+      const docs = await fsQuery<PaymentRequestRecord>('paymentRequests', [], {
+        orderBy: { field: 'submittedAt', direction: 'desc' },
+        limit: 200,
+      });
+      return docs.map((d) => d.data);
     } catch (err: any) {
       console.error(`[FIRESTORE GET ALL PAYMENT REQUESTS ERROR]: ${err.message}`);
       throw err;
@@ -1045,9 +1067,9 @@ export class PaymentStore {
 
   static async getPaymentRequest(requestId: string): Promise<PaymentRequestRecord | null> {
     try {
-      const snap = await db.collection('paymentRequests').doc(requestId).get();
-      if (snap.exists) {
-        return snap.data() as PaymentRequestRecord;
+      const snap = await fsGetDoc<PaymentRequestRecord>('paymentRequests', requestId);
+      if (snap.exists && snap.data) {
+        return snap.data;
       }
     } catch (err: any) {
       console.error(`[FIRESTORE GET PAYMENT REQUEST ERROR]: ${err.message}`);
@@ -1058,15 +1080,13 @@ export class PaymentStore {
 
   static async getUserPaymentRequests(params: { uid?: string; email?: string }): Promise<PaymentRequestRecord[]> {
     try {
-      let query = db.collection('paymentRequests') as FirebaseFirestore.Query;
-      if (params.uid) {
-        query = query.where('uid', '==', params.uid);
-      } else if (params.email) {
-        query = query.where('email', '==', params.email.trim().toLowerCase());
-      }
-      const snap = await query.get();
-      const list: PaymentRequestRecord[] = [];
-      snap.forEach((doc) => list.push(doc.data() as PaymentRequestRecord));
+      const filters = params.uid
+        ? [{ field: 'uid', op: '==' as const, value: params.uid }]
+        : params.email
+          ? [{ field: 'email', op: '==' as const, value: params.email.trim().toLowerCase() }]
+          : [];
+      const docs = await fsQuery<PaymentRequestRecord>('paymentRequests', filters);
+      const list = docs.map((d) => d.data);
       return list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
     } catch (err: any) {
       console.error(`[FIRESTORE GET USER PAYMENT REQUESTS ERROR]: ${err.message}`);
@@ -1092,15 +1112,13 @@ export class PaymentStore {
     const reviewedAt = new Date().toISOString();
     const entitlementId = `ENT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    const reqRef = db.collection('paymentRequests').doc(requestId);
-
-    const result = await db.runTransaction(async (transaction) => {
+    const result = await fsRunTransaction(async (transaction) => {
       // --- 1. ALL READS PERFORMED FIRST ---
-      const reqDoc = await transaction.get(reqRef);
-      if (!reqDoc.exists) {
+      const reqDoc = await transaction.getDoc<PaymentRequestRecord>('paymentRequests', requestId);
+      if (!reqDoc.exists || !reqDoc.data) {
         throw new Error(`Payment request ${requestId} not found.`);
       }
-      const req = reqDoc.data() as PaymentRequestRecord;
+      const req = reqDoc.data;
 
       // Validate & normalize M-Pesa transaction code
       const normCode = normalizeTransactionCode(req.transactionCode);
@@ -1108,21 +1126,18 @@ export class PaymentStore {
         throw new Error(`Invalid M-PESA transaction code: ${req.transactionCode}`);
       }
 
-      const entRef = db.collection('bookEntitlements').doc(`${req.uid}_dating-wrong`);
-      const entDoc = await transaction.get(entRef);
+      const entDocId = `${req.uid}_dating-wrong`;
+      const entDoc = await transaction.getDoc<BookEntitlementRecord>('bookEntitlements', entDocId);
 
-      const usedTxRef = db.collection('usedTransactions').doc(normCode);
-      const usedTxDoc = await transaction.get(usedTxRef);
+      const usedTxDoc = await transaction.getDoc<UsedTransactionRecord>('usedTransactions', normCode);
 
       const paymentId = `PAY-POCHI-${requestId}`;
-      const paymentRef = db.collection('payments').doc(paymentId);
-      const paymentDoc = await transaction.get(paymentRef);
+      const paymentDoc = await transaction.getDoc<PaymentRecord>('payments', paymentId);
 
       // --- 2. VALIDATE PRECONDITIONS & IDEMPOTENCY ---
       if (req.status === 'APPROVED') {
-        if (entDoc.exists) {
-          const existingEnt = entDoc.data() as BookEntitlementRecord;
-          return { success: true, request: req, entitlement: existingEnt, alreadyApproved: true };
+        if (entDoc.exists && entDoc.data) {
+          return { success: true, request: req, entitlement: entDoc.data, alreadyApproved: true };
         }
       }
 
@@ -1130,19 +1145,22 @@ export class PaymentStore {
         throw new Error(`Cannot approve payment request with status "${req.status}". Only PENDING_REVIEW requests can be approved.`);
       }
 
-      if (usedTxDoc.exists) {
-        const usedData = usedTxDoc.data() as UsedTransactionRecord;
-        if (usedData.status === 'REVOKED' || usedData.reusable === false) {
+      if (usedTxDoc.exists && usedTxDoc.data) {
+        const usedData = usedTxDoc.data;
+        if (usedData.status === 'REVOKED') {
           throw new Error(`Transaction code ${normCode} is permanently locked or revoked.`);
         }
         if (usedData.usedForUid !== req.uid) {
           throw new Error(`Transaction code ${normCode} has already been approved for another customer.`);
         }
+        if (usedData.reusable === false) {
+          throw new Error(`Transaction code ${normCode} has already been used.`);
+        }
       }
 
       // --- 3. ALL WRITES PERFORMED STRICTLY AFTER ALL READS ---
-      const entitlement: BookEntitlementRecord = entDoc.exists
-        ? (entDoc.data() as BookEntitlementRecord)
+      const entitlement: BookEntitlementRecord = entDoc.exists && entDoc.data
+        ? entDoc.data
         : {
             uid: req.uid,
             bookId: 'dating-wrong',
@@ -1169,8 +1187,10 @@ export class PaymentStore {
         permanentlyLocked: true,
       };
 
-      const existingPaymentData = paymentDoc.exists ? paymentDoc.data() : {};
+      const existingPaymentData: Partial<PaymentRecord> =
+        paymentDoc.exists && paymentDoc.data ? paymentDoc.data : {};
       const updatedPayment: PaymentRecord = {
+        ...(existingPaymentData || {}),
         paymentId,
         paymentSessionId: requestId,
         uid: req.uid,
@@ -1191,13 +1211,12 @@ export class PaymentStore {
         expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
         securityChecksPassed: true,
         adminAlertSent: true,
-        createdAt: req.submittedAt,
+        createdAt: existingPaymentData.createdAt || req.submittedAt,
         updatedAt: reviewedAt,
         verifiedAt: reviewedAt,
-        ...(existingPaymentData || {}),
       };
 
-      transaction.update(reqRef, {
+      transaction.updateDoc('paymentRequests', requestId, {
         status: 'APPROVED',
         reviewedBy: normalizedAdmin || adminIdentifier,
         reviewedAt,
@@ -1206,15 +1225,15 @@ export class PaymentStore {
         rejectionReason: null,
       });
 
-      transaction.set(usedTxRef, usedRecord);
+      transaction.setDoc('usedTransactions', normCode, usedRecord);
       if (!entDoc.exists) {
-        transaction.set(entRef, entitlement);
+        transaction.setDoc('bookEntitlements', entDocId, entitlement);
       }
-      transaction.set(paymentRef, updatedPayment, { merge: true });
+      transaction.setDoc('payments', paymentId, updatedPayment, { merge: true });
 
-      const actionRef = db.collection('adminActions').doc();
-      transaction.set(actionRef, {
-        actionId: actionRef.id,
+      const actionId = `ACT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+      transaction.setDoc('adminActions', actionId, {
+        actionId,
         adminEmail: normalizedAdmin || adminIdentifier,
         action: 'APPROVE_PAYMENT',
         requestId,
@@ -1271,17 +1290,15 @@ export class PaymentStore {
   }> {
     const normalizedAdmin = (adminIdentifier || '').trim().toLowerCase();
     const reviewedAt = new Date().toISOString();
-    const reqRef = db.collection('paymentRequests').doc(requestId);
     const paymentId = `PAY-POCHI-${requestId}`;
-    const paymentRef = db.collection('payments').doc(paymentId);
 
-    const result = await db.runTransaction(async (transaction) => {
+    const result = await fsRunTransaction(async (transaction) => {
       // 1. Reads
-      const reqDoc = await transaction.get(reqRef);
-      if (!reqDoc.exists) {
+      const reqDoc = await transaction.getDoc<PaymentRequestRecord>('paymentRequests', requestId);
+      if (!reqDoc.exists || !reqDoc.data) {
         throw new Error(`Payment request ${requestId} not found.`);
       }
-      const req = reqDoc.data() as PaymentRequestRecord;
+      const req = reqDoc.data;
 
       // 2. Writes
       req.status = 'REJECTED';
@@ -1289,15 +1306,16 @@ export class PaymentStore {
       req.reviewedAt = reviewedAt;
       req.rejectionReason = reason || 'Payment not verified against Pochi records';
 
-      transaction.update(reqRef, {
+      transaction.updateDoc('paymentRequests', requestId, {
         status: 'REJECTED',
         reviewedBy: req.reviewedBy,
         reviewedAt: req.reviewedAt,
         rejectionReason: req.rejectionReason,
       });
 
-      transaction.set(
-        paymentRef,
+      transaction.setDoc(
+        'payments',
+        paymentId,
         {
           status: 'REJECTED',
           failureReason: req.rejectionReason,
@@ -1306,9 +1324,9 @@ export class PaymentStore {
         { merge: true }
       );
 
-      const actionRef = db.collection('adminActions').doc();
-      transaction.set(actionRef, {
-        actionId: actionRef.id,
+      const actionId = `ACT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+      transaction.setDoc('adminActions', actionId, {
+        actionId,
         adminEmail: normalizedAdmin || adminIdentifier,
         action: 'REJECT_PAYMENT',
         requestId,
@@ -1337,8 +1355,7 @@ export class PaymentStore {
 
   static async updateRequestApprover(requestId: string, adminEmail: string): Promise<PaymentRequestRecord> {
     const cleanAdmin = adminEmail.trim().toLowerCase();
-    const reqRef = db.collection('paymentRequests').doc(requestId);
-    await reqRef.update({ reviewedBy: cleanAdmin });
+    await fsUpdateDoc('paymentRequests', requestId, { reviewedBy: cleanAdmin });
     const req = await this.getPaymentRequest(requestId);
     if (!req) throw new Error(`Request ${requestId} not found`);
     return req;
@@ -1379,43 +1396,41 @@ export class PaymentStore {
 
     // 1. Scan payment requests to discover email, UID, and transaction codes
     try {
-      const snapByUid = await db.collection('paymentRequests').where('uid', '==', cleanId).get();
-      snapByUid.forEach((doc) => {
-        const d = doc.data() as PaymentRequestRecord;
+      const snapByUid = await fsQuery<PaymentRequestRecord>('paymentRequests', [
+        { field: 'uid', op: '==', value: cleanId },
+      ]);
+      for (const doc of snapByUid) {
+        const d = doc.data;
         if (!deletedEmail && d.email) deletedEmail = d.email.toLowerCase();
         if (d.transactionCode) codesToLock.add(normalizeTransactionCode(d.transactionCode));
-      });
+      }
 
       if (deletedEmail) {
-        const snapByEmail = await db.collection('paymentRequests').where('email', '==', deletedEmail).get();
-        snapByEmail.forEach((doc) => {
-          const d = doc.data() as PaymentRequestRecord;
+        const snapByEmail = await fsQuery<PaymentRequestRecord>('paymentRequests', [
+          { field: 'email', op: '==', value: deletedEmail },
+        ]);
+        for (const doc of snapByEmail) {
+          const d = doc.data;
           if (!deletedUid && d.uid) deletedUid = d.uid;
           if (d.transactionCode) codesToLock.add(normalizeTransactionCode(d.transactionCode));
-        });
+        }
       }
     } catch (err: any) {
       console.warn(`[DELETE USER QUERY WARNING] ${err.message}`);
     }
 
-    // 2. Prepare chunked batch operations (max 400 per batch)
-    let batch = db.batch();
-    let batchCount = 0;
-
-    const commitBatchIfNeeded = async () => {
-      if (batchCount >= 400) {
-        await batch.commit();
-        batch = db.batch();
-        batchCount = 0;
-      }
-    };
+    // 2. Prepare batch operations (chunked safely inside fsBatchCommit)
+    const ops: BatchWriteOp[] = [];
 
     // 3. PERMANENTLY LOCK transaction codes (NEVER DELETE)
     for (const code of codesToLock) {
       if (code) {
-        batch.set(
-          db.collection('usedTransactions').doc(code),
-          {
+        ops.push({
+          type: 'set',
+          col: 'usedTransactions',
+          docId: code,
+          merge: true,
+          data: {
             transactionCode: code,
             status: 'REVOKED',
             reusable: false,
@@ -1423,55 +1438,43 @@ export class PaymentStore {
             revocationReason: `User ${deletedEmail || deletedUid || cleanId} deleted by admin ${adminEmail}`,
             permanentlyLocked: true,
           },
-          { merge: true }
-        );
-        batchCount++;
-        await commitBatchIfNeeded();
+        });
       }
     }
 
-    // 4. Delete entitlements
-    const targetUids = [deletedUid, cleanId].filter(Boolean);
+    // 4. Delete entitlements, progress, bookmarks, user
+    const targetUids = Array.from(new Set([deletedUid, cleanId].filter(Boolean)));
     for (const uid of targetUids) {
-      const entRef = db.collection('bookEntitlements').doc(`${uid}_dating-wrong`);
-      batch.delete(entRef);
-      batchCount++;
+      ops.push({ type: 'delete', col: 'bookEntitlements', docId: `${uid}_dating-wrong` });
       purgedEntitlements++;
-      await commitBatchIfNeeded();
-
-      // Delete reading progress and bookmarks
-      batch.delete(db.collection('readingProgress').doc(`${uid}_dating-wrong`));
-      batch.delete(db.collection('bookmarks').doc(`${uid}_dating-wrong`));
-      batch.delete(db.collection('users').doc(uid));
-      batchCount += 3;
-      await commitBatchIfNeeded();
+      ops.push({ type: 'delete', col: 'readingProgress', docId: `${uid}_dating-wrong` });
+      ops.push({ type: 'delete', col: 'bookmarks', docId: `${uid}_dating-wrong` });
+      ops.push({ type: 'delete', col: 'users', docId: uid });
     }
 
     // 5. Delete devices
     for (const uid of targetUids) {
-      const devSnap = await db.collection('devices').where('userId', '==', uid).get();
-      for (const devDoc of devSnap.docs) {
-        batch.delete(devDoc.ref);
-        batchCount++;
+      const devDocs = await fsQuery<StoredAuthorizedDevice>('devices', [
+        { field: 'userId', op: '==', value: uid },
+      ]);
+      for (const devDoc of devDocs) {
+        ops.push({ type: 'delete', col: 'devices', docId: devDoc.id });
         purgedDevices++;
-        await commitBatchIfNeeded();
       }
     }
 
     // 6. Delete payment requests
     for (const uid of targetUids) {
-      const reqSnap = await db.collection('paymentRequests').where('uid', '==', uid).get();
-      for (const reqDoc of reqSnap.docs) {
-        batch.delete(reqDoc.ref);
-        batchCount++;
+      const reqDocs = await fsQuery<PaymentRequestRecord>('paymentRequests', [
+        { field: 'uid', op: '==', value: uid },
+      ]);
+      for (const reqDoc of reqDocs) {
+        ops.push({ type: 'delete', col: 'paymentRequests', docId: reqDoc.id });
         purgedPaymentRequests++;
-        await commitBatchIfNeeded();
       }
     }
 
-    if (batchCount > 0) {
-      await batch.commit();
-    }
+    await fsBatchCommit(ops);
 
     console.warn(
       `[SECURITY: USER DELETED & PERMANENTLY REVOKED] User ${deletedEmail || deletedUid || cleanId} deleted by admin ${adminEmail}. ` +
@@ -1529,13 +1532,13 @@ export class PaymentStore {
     const normCode = normalizeTransactionCode(parsed.transactionCode);
 
     // Query Firestore for this transaction code in paymentRequests
-    const snap = await db
-      .collection('paymentRequests')
-      .where('transactionCode', '==', normCode)
-      .limit(1)
-      .get();
+    const docs = await fsQuery<PaymentRequestRecord>(
+      'paymentRequests',
+      [{ field: 'transactionCode', op: '==', value: normCode }],
+      { limit: 1 }
+    );
 
-    if (snap.empty) {
+    if (docs.length === 0) {
       return {
         approved: false,
         reason: `Transaction code ${normCode} is not on record as an approved purchase.`,
@@ -1551,7 +1554,7 @@ export class PaymentStore {
       };
     }
 
-    const req = snap.docs[0].data() as PaymentRequestRecord;
+    const req = docs[0].data;
 
     if (req.status !== 'APPROVED') {
       return {
