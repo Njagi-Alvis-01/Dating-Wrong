@@ -351,13 +351,17 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
 
   // Step 3: Daraja Webhook Callback (Called directly by Safaricom servers upon PIN authorization)
   app.post('/api/payments/daraja/callback', async (req, res) => {
-    console.log('[Daraja Callback Webhook Received]', JSON.stringify(req.body));
+    console.log('[Daraja Callback Webhook Received]');
     try {
       const parsed = daraja.parseCallback(req.body);
 
       const payment = await PaymentStore.getPaymentByCheckoutRequestId(parsed.checkoutRequestId);
       if (!payment) {
-        console.warn(`[Daraja Callback] No payment session found for CheckoutRequestID ${parsed.checkoutRequestId}`);
+        console.warn('[Daraja Callback] No matching payment session found.');
+        return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+      }
+      if (payment.merchantRequestId && parsed.merchantRequestId !== payment.merchantRequestId) {
+        console.error('[Daraja Callback] MerchantRequestID does not match the stored payment session.');
         return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
       }
 
@@ -366,6 +370,13 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
         payment.status = 'FAILED';
         payment.failureReason = parsed.resultDesc;
         payment.updatedAt = new Date().toISOString();
+        return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+      }
+
+      // Confirm the CheckoutRequestID with Safaricom before granting any entitlement.
+      const safaricomResult = await daraja.verifyStkPush(parsed.checkoutRequestId);
+      if (!safaricomResult.isSuccessful) {
+        console.warn(`[Daraja Callback] Safaricom query did not confirm success: ${safaricomResult.resultDesc}`);
         return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
       }
 
