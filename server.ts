@@ -9,7 +9,7 @@ import { EmailConfirmationService } from './server/emailConfirmationService.ts';
 import { AccessTicketStore } from './server/accessTicketStore.ts';
 import { requireAdminAuth, generateAdminSessionToken, ADMIN_ALLOWLIST } from './server/middleware/auth.ts';
 import { adminAuth } from './server/firebaseAdmin.ts';
-import { runWithRequestAuth, isUnauthenticatedPermissionError } from './server/firestoreAdapter.ts';
+import { runWithRequestAuth, isUnauthenticatedPermissionError, fsSetDoc } from './server/firestoreAdapter.ts';
 import { verifyPastedMpesaSms } from './src/utils/mpesaSmsParser.ts';
 import { normalizeKenyanPhone } from './src/utils/phoneNormalization.ts';
 
@@ -1178,10 +1178,15 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   });
 
   // Section 44: Admin Book Management
-  app.post('/api/admin/book-config', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/book-config', requireAdminAuth, async (req, res) => {
     const { title, subtitle, priceKes, activeVersion, publisher } = req.body;
     if (priceKes) {
       PaymentStore.setConfiguredPrice(Number(priceKes));
+      await fsSetDoc('config', 'book-settings', {
+        bookPriceKes: Number(priceKes),
+        updatedBy: (req as any).adminUser?.email || 'authorized-admin',
+        updatedAt: new Date().toISOString(),
+      }, { merge: true });
     }
     res.json({
       success: true,
@@ -1385,7 +1390,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   });
 
   // Admin: Update Pochi la Biashara configuration
-  app.post('/api/admin/config/pochi', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/config/pochi', requireAdminAuth, async (req, res) => {
     const { pochiPhone, pochiName, priceKes, instructions } = req.body;
     PaymentStore.updatePochiConfig({
       pochiPhone,
@@ -1393,6 +1398,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       priceKes: priceKes ? Number(priceKes) : undefined,
       instructions,
     });
+    await fsSetDoc('config', 'pochi-settings', PaymentStore.getPochiConfig(), { merge: true });
     res.json({
       success: true,
       message: 'Pochi la Biashara configuration updated.',
