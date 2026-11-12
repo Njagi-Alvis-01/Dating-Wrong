@@ -1354,13 +1354,13 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.get('/api/admin/notifications/toggle', requireAdminAuth, (req, res) => {
     res.json({
       success: true,
-      pendingApprovalsNotificationsEnabled: NotificationService.isPendingApprovalsNotificationsEnabled(),
+      pendingApprovalsNotificationsEnabled: await NotificationService.isPendingApprovalsNotificationsEnabled(),
     });
   });
 
   app.post('/api/admin/notifications/toggle', requireAdminAuth, (req, res) => {
     const { enabled } = req.body;
-    const newState = NotificationService.setPendingApprovalsNotificationsEnabled(Boolean(enabled));
+    const newState = await NotificationService.setPendingApprovalsNotificationsEnabled(Boolean(enabled));
     res.json({
       success: true,
       pendingApprovalsNotificationsEnabled: newState,
