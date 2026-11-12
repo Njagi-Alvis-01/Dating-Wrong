@@ -350,6 +350,23 @@ export class NotificationService {
     const results: SmsDispatchResult[] = [];
     const mailFrom = process.env.SMTP_FROM || `"Dating Wrong" <${gmailUser || 'no-reply@datingwrong.online'}>`;
 
+    if (!transporter && !smsConfigured) {
+      return {
+        success: false,
+        smsBody: 'SMS provider not configured',
+        emailBody: 'SMTP provider not configured',
+        dispatchedTo: ADMIN_CONTACTS.map((admin) => ({
+          recipient: `${admin.name} <${admin.email}>`,
+          phone: normalizeKenyanPhone(admin.phone).displayLocal || admin.phone,
+          status: 'not_configured' as const,
+          emailStatus: 'not_configured' as const,
+          smsStatus: 'not_configured' as const,
+          messageId: `NOT-CONFIGURED-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+        })),
+      };
+    }
+
     // Create all three unique admin review tickets before sending any alert.
     // A ticket-generation failure must not result in a misleading "sent" record.
     const tickets = await Promise.all(
@@ -406,8 +423,13 @@ export class NotificationService {
           });
           const smsBody = await smsResponse.text();
           if (!smsResponse.ok) throw new Error(`Africa's Talking returned HTTP ${smsResponse.status}: ${smsBody.slice(0, 300)}`);
+          const parsedSmsResponse = JSON.parse(smsBody);
+          const recipientResult = parsedSmsResponse?.SMSMessageData?.Recipients?.[0];
+          if (!recipientResult || Number(recipientResult.statusCode) >= 400) {
+            throw new Error(recipientResult?.status || 'Africa\'s Talking did not confirm SMS acceptance.');
+          }
           smsStatus = 'sent';
-          console.log(`[SMS ACCEPTED BY PROVIDER] ${admin.name} <${normalized.displayLocal || admin.phone}>`);
+          console.log(`[SMS ACCEPTED BY PROVIDER] ${admin.name} <${normalized.displayLocal || admin.phone}>: ${recipientResult.status || recipientResult.statusCode}`);
         } catch (smsErr: any) {
           smsStatus = 'failed';
           console.error(`[SMS DELIVERY FAILED] ${admin.name}: ${smsErr.message}`);
