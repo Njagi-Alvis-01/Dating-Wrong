@@ -677,11 +677,22 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
         baseUrl,
       });
 
+      const notificationsDelivered = Boolean(result.notificationResult?.success);
       res.json({
         success: true,
-        message: 'Payment verification request received. Administrators have been notified for review.',
+        message: notificationsDelivered
+          ? 'Payment verification request received and administrator alerts were delivered.'
+          : 'Payment verification request was saved, but administrator alerts could not be confirmed. The request remains available in the admin dashboard.',
         requestId: result.request.requestId,
         status: 'PENDING_REVIEW',
+        notificationsDelivered,
+        notificationResult: result.notificationResult
+          ? {
+              success: result.notificationResult.success,
+              muted: result.notificationResult.muted || false,
+              dispatchedTo: result.notificationResult.dispatchedTo,
+            }
+          : null,
         request: result.request,
         parsedDetails: {
           transactionCode: normalizedCode,
