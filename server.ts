@@ -1168,8 +1168,8 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   });
 
   // Section 46: SMS Monitoring Logs
-  app.get('/api/admin/sms-logs', requireAdminAuth, (req, res) => {
-    res.json({ logs: NotificationService.getRecentLogs() });
+  app.get('/api/admin/sms-logs', requireAdminAuth, async (req, res) => {
+    res.json({ logs: await NotificationService.getRecentLogs() });
   });
 
   // Section 37: Customer Email Confirmation Logs
