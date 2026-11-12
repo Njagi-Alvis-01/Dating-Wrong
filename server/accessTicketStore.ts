@@ -15,7 +15,7 @@
 
 import crypto from 'crypto';
 import { fsGetDoc, fsSetDoc, fsRunTransaction } from './firestoreAdapter.ts';
-import { BookEntitlementRecord } from './paymentStore.ts';
+import type { BookEntitlementRecord } from './paymentStore.ts';
 
 export interface AccessTicket {
   ticketId: string; // Plain token in memory / during creation
