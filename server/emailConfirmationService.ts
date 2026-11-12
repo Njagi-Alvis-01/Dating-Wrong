@@ -16,6 +16,7 @@
 
 import nodemailer from 'nodemailer';
 import { AccessTicketStore } from './accessTicketStore.ts';
+import { fsQuery, fsSetDoc } from './firestoreAdapter.ts';
 
 export interface EmailConfirmationParams {
   customerEmail: string;
@@ -58,31 +59,25 @@ export class EmailConfirmationService {
     const gmailUser = process.env.GMAIL_USER || process.env.SMTP_USER;
     const gmailPass = process.env.GMAIL_PASS || process.env.SMTP_PASS;
 
-    if (gmailUser && gmailPass) {
-      try {
-        return nodemailer.createTransport({
-          service: 'gmail',
-          auth: {
-            user: gmailUser,
-            pass: gmailPass,
-          },
-        });
-      } catch (err) {
-        console.warn('[Customer Email Confirmation Gmail Transport Warning]', err);
-      }
-    } else if (process.env.SMTP_HOST && process.env.SMTP_USER) {
+    if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
       try {
         return nodemailer.createTransport({
           host: process.env.SMTP_HOST,
           port: parseInt(process.env.SMTP_PORT || '587', 10),
           secure: process.env.SMTP_PORT === '465',
-          auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASS,
-          },
+          auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
         });
       } catch (err) {
         console.warn('[Customer Email Confirmation SMTP Transport Warning]', err);
+      }
+    } else if (process.env.GMAIL_USER && process.env.GMAIL_PASS) {
+      try {
+        return nodemailer.createTransport({
+          service: 'gmail',
+          auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASS },
+        });
+      } catch (err) {
+        console.warn('[Customer Email Confirmation Gmail Transport Warning]', err);
       }
     }
     return null;
@@ -189,7 +184,7 @@ Published by Mark & Alvis
 </html>
     `.trim();
 
-    let dispatchStatus: 'SENT' | 'SIMULATED' | 'FAILED' = 'SIMULATED';
+    let dispatchStatus: 'SENT' | 'SIMULATED' | 'FAILED' = process.env.VERCEL === '1' ? 'FAILED' : 'SIMULATED';
     const transporter = this.getTransporter();
     const mailUser = process.env.GMAIL_USER || process.env.SMTP_USER || 'orders@datingwrong.ke';
     const fromAddress = process.env.SMTP_FROM || `"Dating Wrong" <${mailUser}>`;
@@ -222,10 +217,10 @@ Published by Mark & Alvis
       bodyHtml,
     };
 
-    this.emailLogs.unshift(log);
+    await this.recordEmailLog(log);
     console.log(`[Email Confirmation] Recorded "${subject}" to ${params.customerEmail} for ref ${params.transactionReference} (Status: ${dispatchStatus})`);
 
-    return { success: dispatchStatus !== 'FAILED', log };
+    return { success: dispatchStatus === 'SENT', log };
   }
 
   /**
@@ -349,7 +344,25 @@ Published by Mark & Alvis
     return { success: dispatchStatus !== 'FAILED', log };
   }
 
-  static getRecentEmailLogs(): EmailLogEntry[] {
-    return this.emailLogs;
+  private static async recordEmailLog(log: EmailLogEntry): Promise<void> {
+    this.emailLogs.unshift(log);
+    try {
+      await fsSetDoc('emailLogs', log.id, log);
+    } catch (err: any) {
+      console.error('[CUSTOMER EMAIL LOG PERSISTENCE ERROR]', err.message);
+    }
+  }
+
+  static async getRecentEmailLogs(): Promise<EmailLogEntry[]> {
+    try {
+      const docs = await fsQuery<EmailLogEntry>('emailLogs', [], {
+        orderBy: { field: 'sentAt', direction: 'desc' },
+        limit: 100,
+      });
+      return docs.map((item) => item.data);
+    } catch (err: any) {
+      console.warn('[CUSTOMER EMAIL LOG READ]', err.message);
+      return this.emailLogs;
+    }
   }
 }
