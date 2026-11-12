@@ -95,37 +95,28 @@ export class DarajaService {
    * Acquire OAuth access token from Safaricom Daraja
    */
   async getAccessToken(): Promise<string> {
-    // If live credentials are missing in development/preview sandbox, provide clean fallback token
     if (!this.config.consumerKey || !this.config.consumerSecret) {
-      return 'DARAJA_INTERNAL_AUTH_TOKEN_' + Date.now();
+      throw new Error('Safaricom Daraja credentials are not configured. Use the manual Pochi payment flow or configure live Daraja credentials.');
     }
 
     if (this.cachedToken && Date.now() < this.cachedToken.expiresAt) {
       return this.cachedToken.token;
     }
 
-    try {
-      const auth = Buffer.from(`${this.config.consumerKey}:${this.config.consumerSecret}`).toString('base64');
-      const res = await fetch(`${this.baseUrl}/oauth/v1/generate?grant_type=client_credentials`, {
-        headers: {
-          Authorization: `Basic ${auth}`,
-        },
-      });
-
-      if (!res.ok) {
-        throw new Error(`Daraja Auth failed with status ${res.status}`);
-      }
-
-      const data = await res.json();
-      this.cachedToken = {
-        token: data.access_token,
-        expiresAt: Date.now() + (parseInt(data.expires_in, 10) - 60) * 1000,
-      };
-      return data.access_token;
-    } catch (err: any) {
-      console.warn('Daraja Auth warning (using internal auth):', err.message);
-      return 'DARAJA_INTERNAL_AUTH_TOKEN_' + Date.now();
+    const auth = Buffer.from(`${this.config.consumerKey}:${this.config.consumerSecret}`).toString('base64');
+    const res = await fetch(`${this.baseUrl}/oauth/v1/generate?grant_type=client_credentials`, {
+      headers: { Authorization: `Basic ${auth}` },
+    });
+    const data: any = await res.json().catch(() => ({}));
+    if (!res.ok || !data.access_token) {
+      throw new Error(`Daraja OAuth failed (${res.status}): ${data.error_description || data.errorMessage || 'No access token returned'}`);
     }
+
+    this.cachedToken = {
+      token: data.access_token,
+      expiresAt: Date.now() + (parseInt(data.expires_in || '3600', 10) - 60) * 1000,
+    };
+    return data.access_token;
   }
 
   /**
@@ -133,8 +124,10 @@ export class DarajaService {
    * Format: Base64(ShortCode + Passkey + Timestamp YYYYMMDDHHmmss)
    */
   generatePassword(timestamp: string): string {
-    const passkey = this.config.passkey || 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
-    return Buffer.from(`${this.config.shortCode}${passkey}${timestamp}`).toString('base64');
+    if (!this.config.passkey || !this.config.shortCode) {
+      throw new Error('Daraja shortcode and passkey must be configured before initiating STK Push.');
+    }
+    return Buffer.from(`${this.config.shortCode}${this.config.passkey}${timestamp}`).toString('base64');
   }
 
   getTimestamp(): string {
@@ -158,18 +151,20 @@ export class DarajaService {
     if (!phoneNorm.isValid) {
       throw new Error(`Invalid Kenyan phone number for Daraja: ${params.phone}`);
     }
+    if (!this.config.passkey || !this.config.shortCode || !this.config.callbackUrl) {
+      throw new Error('Daraja STK Push is not configured. Please use the Pochi la Biashara manual payment option.');
+    }
 
     const timestamp = this.getTimestamp();
     const password = this.generatePassword(timestamp);
     const token = await this.getAccessToken();
-
     const requestPayload = {
       BusinessShortCode: this.config.shortCode,
       Password: password,
       Timestamp: timestamp,
       TransactionType: 'CustomerPayBillOnline',
       Amount: Math.round(params.amount),
-      PartyA: phoneNorm.canonical, // 2547XXXXXXXX
+      PartyA: phoneNorm.canonical,
       PartyB: this.config.shortCode,
       PhoneNumber: phoneNorm.canonical,
       CallBackURL: this.config.callbackUrl,
@@ -177,49 +172,61 @@ export class DarajaService {
       TransactionDesc: params.transactionDesc.slice(0, 13),
     };
 
-    console.log(`[Daraja STK Push] Sending prompt to ${phoneNorm.canonical} for KES ${params.amount}`);
-
-    // If live credentials are present, invoke Safaricom API directly
-    if (this.config.consumerKey && !token.startsWith('DARAJA_INTERNAL_AUTH_TOKEN')) {
-      try {
-        const response = await fetch(`${this.baseUrl}/mpesa/stkpush/v1/processrequest`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(requestPayload),
-        });
-
-        const resData = await response.json();
-        if (response.ok && resData.ResponseCode === '0') {
-          return {
-            merchantRequestId: resData.MerchantRequestID,
-            checkoutRequestId: resData.CheckoutRequestID,
-            responseCode: resData.ResponseCode,
-            responseDescription: resData.ResponseDescription,
-            customerMessage: resData.CustomerMessage,
-            normalizedPhone: phoneNorm.canonical,
-            amount: params.amount,
-          };
-        }
-      } catch (err: any) {
-        console.error('[Daraja Live STK Error]', err.message);
-      }
+    const response = await fetch(`${this.baseUrl}/mpesa/stkpush/v1/processrequest`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestPayload),
+    });
+    const data: any = await response.json().catch(() => ({}));
+    if (!response.ok || data.ResponseCode !== '0' || !data.CheckoutRequestID || !data.MerchantRequestID) {
+      throw new Error(`Daraja STK Push failed (${response.status}): ${data.errorMessage || data.ResponseDescription || 'Safaricom did not accept the request'}`);
     }
 
-    // High-fidelity standard response matching Daraja protocol exactly
-    const checkoutRequestId = `ws_CO_${Date.now()}_${Math.floor(Math.random() * 10000000)}`;
-    const merchantRequestId = `MR_${Math.floor(Math.random() * 100000)}_${Date.now().toString().slice(-4)}`;
-
     return {
-      merchantRequestId,
-      checkoutRequestId,
-      responseCode: '0',
-      responseDescription: 'Success. Request accepted for processing',
-      customerMessage: `Success. Request accepted for processing. Check your phone (${phoneNorm.displayLocal}) for the Safaricom M-PESA PIN prompt.`,
+      merchantRequestId: data.MerchantRequestID,
+      checkoutRequestId: data.CheckoutRequestID,
+      responseCode: data.ResponseCode,
+      responseDescription: data.ResponseDescription,
+      customerMessage: data.CustomerMessage || 'M-PESA prompt sent. Complete payment on your phone.',
       normalizedPhone: phoneNorm.canonical,
       amount: params.amount,
+    };
+  }
+
+  /**
+   * Verify the callback's CheckoutRequestID against Safaricom's STK query API.
+   * A public callback payload alone is not sufficient proof of payment.
+   */
+  async verifyStkPush(checkoutRequestId: string): Promise<{ isSuccessful: boolean; resultCode: string; resultDesc: string }> {
+    if (!checkoutRequestId) throw new Error('CheckoutRequestID is required for Daraja verification.');
+    const timestamp = this.getTimestamp();
+    const password = this.generatePassword(timestamp);
+    const token = await this.getAccessToken();
+    const response = await fetch(`${this.baseUrl}/mpesa/stkpushquery/v1/query`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        BusinessShortCode: this.config.shortCode,
+        Password: password,
+        Timestamp: timestamp,
+        CheckoutRequestID: checkoutRequestId,
+      }),
+    });
+    const data: any = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(`Daraja STK query failed (${response.status}): ${data.errorMessage || 'Unable to verify transaction'}`);
+    }
+    const resultCode = String(data.ResultCode ?? '');
+    return {
+      isSuccessful: resultCode === '0',
+      resultCode,
+      resultDesc: String(data.ResultDesc || 'No Daraja transaction result returned'),
     };
   }
 
@@ -233,7 +240,7 @@ export class DarajaService {
     }
 
     const { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } = callback;
-    const isSuccessful = ResultCode === 0;
+    const isSuccessful = Number(ResultCode) === 0;
 
     let transactionCode: string | undefined;
     let amount: number | undefined;
