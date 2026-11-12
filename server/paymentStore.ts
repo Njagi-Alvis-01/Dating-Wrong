@@ -240,7 +240,11 @@ export class PaymentStore {
    */
   static async initFromFirestore(): Promise<void> {
     try {
-      const docs = await fsQuery<PaymentRecord>('payments', [], { limit: 100 });
+      const [docs, bookSettings, pochiSettings] = await Promise.all([
+        fsQuery<PaymentRecord>('payments', [], { limit: 100 }),
+        fsGetDoc<any>('config', 'book-settings'),
+        fsGetDoc<any>('config', 'pochi-settings'),
+      ]);
       for (const d of docs) {
         const data = d.data;
         if (data && data.paymentId) {
@@ -250,7 +254,21 @@ export class PaymentStore {
           }
         }
       }
-      console.log(`[FIRESTORE SYNC] Hydrated server payment session indices from Firestore.`);
+      if (bookSettings.exists && bookSettings.data?.bookPriceKes) {
+        this.configuredPriceKes = Number(bookSettings.data.bookPriceKes) || this.configuredPriceKes;
+      }
+      if (bookSettings.exists && bookSettings.data?.paybillNumber) {
+        this.configuredPaybill = String(bookSettings.data.paybillNumber);
+      }
+      if (pochiSettings.exists && pochiSettings.data) {
+        this.updatePochiConfig({
+          pochiPhone: pochiSettings.data.pochiPhone,
+          pochiName: pochiSettings.data.pochiName,
+          priceKes: Number(pochiSettings.data.priceKes) || undefined,
+          instructions: pochiSettings.data.instructions,
+        });
+      }
+      console.log('[FIRESTORE SYNC] Hydrated payment sessions and persisted checkout configuration.');
     } catch (err: any) {
       console.error(`[FIRESTORE HYDRATE ERROR] ${err.message}`);
       if (process.env.VERCEL === '1') {
