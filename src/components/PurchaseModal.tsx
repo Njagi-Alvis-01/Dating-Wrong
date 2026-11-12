@@ -734,7 +734,7 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
               <div className="relative flex items-center justify-center my-2">
                 <div className="border-t border-[#E5DAC6] w-full" />
                 <span className="bg-[#FBF9F5] px-3 text-[10px] uppercase font-bold tracking-widest text-[#A89884] shrink-0">
-                  Or enter your Google email
+                  Check an existing purchase
                 </span>
               </div>
 
@@ -758,7 +758,7 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
                   disabled={isSigningIn}
                   className="w-full py-2.5 px-4 rounded-[2px] bg-[#171717] hover:bg-[#262626] text-[#FAF7F2] font-ui-sans font-semibold text-xs tracking-wider uppercase transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
                 >
-                  {isSigningIn ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <span>Continue &rarr;</span>}
+                  {isSigningIn ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <span>Check Existing Access &rarr;</span>}
                 </button>
               </form>
 
