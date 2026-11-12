@@ -21,7 +21,7 @@ import { BookMetadata, UserEntitlement } from '../types.ts';
 import { EntitlementService } from '../services/entitlementService.ts';
 import { useAuth } from '../context/AuthContext.tsx';
 import { parseMpesaSms } from '../utils/mpesaSmsParser.ts';
-import { doc, setDoc, serverTimestamp, onSnapshot } from 'firebase/firestore';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { db } from '../services/firebase.ts';
 import { authorizedFetch } from '../utils/authorizedFetch.ts';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock.ts';
@@ -67,6 +67,7 @@ interface SubmittedRequestInfo {
   transactionTime: string;
   submittedAt: string;
   status: 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED';
+  notificationsDelivered?: boolean;
   rejectionReason?: string | null;
 }
 
@@ -87,7 +88,6 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
     bookConfig,
     grantUserEntitlement,
     signInWithGoogle,
-    continueWithEmail,
     checkAndRestoreEmailAccess,
   } = useAuth();
 
@@ -491,8 +491,9 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
         );
       }
 
-      await continueWithEmail(cleanEmail, name.trim());
-      setStep('pochi_instructions_and_sms');
+      setErrorMsg(
+        'A new purchase requires Google Sign-In. Use the “Continue with Google” button so your payment request is securely linked to your verified account.'
+      );
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not verify email session.');
     } finally {
@@ -514,20 +515,11 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
     e.preventDefault();
     setErrorMsg(null);
 
-    let activeUser = currentUser;
-    let activeEmail = (activeUser?.email || emailInput).trim().toLowerCase();
+    const activeUser = currentUser;
+    const activeEmail = (activeUser?.email || '').trim().toLowerCase();
 
-    // Map Google email into user session if entered directly without popup
-    if (!activeUser && activeEmail) {
-      try {
-        activeUser = await continueWithEmail(activeEmail, name.trim());
-      } catch (sessionErr) {
-        console.warn('Auto continue with email session notice:', sessionErr);
-      }
-    }
-
-    if (!activeEmail || !activeEmail.includes('@')) {
-      setErrorMsg('Please enter a valid Google email address before submitting your payment SMS.');
+    if (!activeUser || !activeEmail || !activeEmail.includes('@')) {
+      setErrorMsg('Please sign in with Google before submitting your M-PESA confirmation SMS.');
       setStep('google_sign_in');
       return;
     }
@@ -537,7 +529,7 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
       return;
     }
 
-    const uid = activeUser?.uid || currentUser?.uid || `usr_${activeEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    const uid = activeUser.uid;
 
     setIsSubmittingSms(true);
 
@@ -567,45 +559,18 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
 
       const reqId = data.requestId || data.request?.requestId || `REQ-${Date.now()}`;
 
-      // Store in Firestore 'paymentRequests' collection as PENDING_REVIEW
-      try {
-        await setDoc(doc(db, 'paymentRequests', reqId), {
-          requestId: reqId,
-          uid,
-          email: activeEmail,
-          customerName: name.trim() || activeUser?.displayName || currentUser?.displayName || 'Valued Reader',
-          submittedSms: pastedSms.trim(),
-          transactionCode: data.parsedDetails?.transactionCode || 'PENDING',
-          amount: data.parsedDetails?.amount || pochiConfig.priceKes,
-          expectedAmount: pochiConfig.priceKes,
-          senderPhone: data.parsedDetails?.senderPhone || phone,
-          senderName: data.parsedDetails?.senderName || name.trim() || '',
-          recipientDetails: pochiConfig.pochiName || 'Alvis Njagi',
-          transactionTime: data.parsedDetails?.transactionTime || 'Stated in SMS',
-          submittedAt: new Date().toISOString(),
-          status: 'PENDING_REVIEW',
-          reviewedBy: null,
-          reviewedAt: null,
-          rejectionReason: null,
-          entitlementId: null,
-          notifiedAdmins: ['Mark', 'Gerishon Wanyeki', 'Alvis Njagi'],
-          createdAt: serverTimestamp(),
-        });
-      } catch (firestoreErr) {
-        console.warn('Firestore paymentRequests write notice:', firestoreErr);
-      }
-
       // Set active request and enter pending approval state
       setActiveRequest({
         requestId: reqId,
         transactionCode: data.parsedDetails?.transactionCode || 'PENDING',
         amount: data.parsedDetails?.amount || pochiConfig.priceKes,
         email: activeEmail,
-        customerName: name.trim() || currentUser.displayName || 'Valued Reader',
+        customerName: name.trim() || activeUser.displayName || 'Valued Reader',
         senderPhone: data.parsedDetails?.senderPhone || phone,
         transactionTime: data.parsedDetails?.transactionTime || 'Stated in SMS',
         submittedAt: new Date().toISOString(),
         status: 'PENDING_REVIEW',
+        notificationsDelivered: Boolean(data.notificationsDelivered),
       });
 
       setStep('pending_approval');
@@ -1048,9 +1013,9 @@ export const PurchaseModal: React.FC<PurchaseModalProps> = ({
                   Payment Verification Request Submitted
                 </h4>
                 <p className="mt-2 font-book-serif text-xs text-[#57534E] max-w-sm mx-auto leading-relaxed">
-                  All three administrators (<strong>Mark</strong>, <strong>Gerishon</strong>, and{' '}
-                  <strong>Alvis</strong>) have received Email and SMS notifications with your
-                  transaction details. Access will be unlocked as soon as one admin approves.
+                  {activeRequest.notificationsDelivered
+                    ? 'Your payment request has been recorded and administrator alerts were delivered through the configured notification channels. Access will be unlocked as soon as one admin approves.'
+                    : 'Your payment request has been recorded, but administrator alerts could not be confirmed. Please contact the publishers so they can review the pending request.'}
                 </p>
               </div>
 
