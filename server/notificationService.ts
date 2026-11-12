@@ -11,6 +11,7 @@
 import { normalizeKenyanPhone } from '../src/utils/phoneNormalization.ts';
 import nodemailer from 'nodemailer';
 import { AccessTicketStore } from './accessTicketStore.ts';
+import { fsGetDoc, fsSetDoc } from './firestoreAdapter.ts';
 
 export interface AdminContact {
   name: string;
@@ -109,13 +110,27 @@ export class NotificationService {
 
   private static pendingApprovalsNotificationsEnabled = true;
 
-  static isPendingApprovalsNotificationsEnabled(): boolean {
+  static async isPendingApprovalsNotificationsEnabled(): Promise<boolean> {
+    try {
+      const snap = await fsGetDoc<any>('config', 'admin-notifications');
+      const persisted = snap.data?.pendingApprovalsNotificationsEnabled ?? snap.data?.enabled;
+      if (typeof persisted === 'boolean') {
+        this.pendingApprovalsNotificationsEnabled = persisted;
+      }
+    } catch (err: any) {
+      console.warn('[NOTIFICATION SETTINGS READ]', err.message);
+    }
     return this.pendingApprovalsNotificationsEnabled;
   }
 
-  static setPendingApprovalsNotificationsEnabled(enabled: boolean): boolean {
+  static async setPendingApprovalsNotificationsEnabled(enabled: boolean): Promise<boolean> {
+    await fsSetDoc('config', 'admin-notifications', {
+      enabled,
+      pendingApprovalsNotificationsEnabled: enabled,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
     this.pendingApprovalsNotificationsEnabled = enabled;
-    return this.pendingApprovalsNotificationsEnabled;
+    return enabled;
   }
 
   static getRecentLogs() {
@@ -300,7 +315,7 @@ export class NotificationService {
     dispatchedTo: SmsDispatchResult[];
     muted?: boolean;
   }> {
-    if (!this.pendingApprovalsNotificationsEnabled) {
+    if (!(await this.isPendingApprovalsNotificationsEnabled())) {
       return {
         success: false,
         muted: true,
