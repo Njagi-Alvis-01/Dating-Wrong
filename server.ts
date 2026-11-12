@@ -56,6 +56,8 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
           (req as any).firebaseUser = {
             uid: decoded.uid,
             email: (decoded.email || '').trim().toLowerCase(),
+            emailVerified: decoded.email_verified === true,
+            signInProvider: decoded.firebase?.sign_in_provider || '',
           };
           return runWithRequestAuth(
             {
@@ -583,8 +585,8 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       const { uid, email, customerName, submittedSms, senderPhone } = req.body;
       const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
 
-      if (!authenticatedUser) {
-        return res.status(401).json({ success: false, error: 'A valid signed-in account is required. Please sign in again.' });
+      if (!authenticatedUser || !authenticatedUser.emailVerified || authenticatedUser.signInProvider !== 'google.com') {
+        return res.status(401).json({ success: false, error: 'Please sign in with a verified Google account before submitting your M-PESA confirmation SMS.' });
       }
       if (uid !== authenticatedUser.uid || String(email || '').trim().toLowerCase() !== authenticatedUser.email) {
         return res.status(403).json({ success: false, error: 'The submitted account does not match your verified sign-in session.' });
@@ -716,10 +718,18 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.get('/api/payments/pochi/request-status/:requestId', async (req, res) => {
     try {
       const { requestId } = req.params;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string } | undefined;
+      if (!authenticatedUser) {
+        return res.status(401).json({ success: false, error: 'Sign in to check your payment request.' });
+      }
       const request = await PaymentStore.getPaymentRequest(requestId);
 
       if (!request) {
         return res.status(404).json({ success: false, error: 'Payment request not found.' });
+      }
+
+      if (request.uid !== authenticatedUser.uid) {
+        return res.status(403).json({ success: false, error: 'You are not authorized to view this payment request.' });
       }
 
       let entitlement = null;
@@ -745,8 +755,12 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   // Get user's payment requests
   app.get('/api/payments/pochi/user-requests', async (req, res) => {
     try {
-      const uid = req.query.uid as string;
-      const email = req.query.email as string;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      if (!authenticatedUser) {
+        return res.status(401).json({ success: false, error: 'Sign in to retrieve your payment requests.' });
+      }
+      const uid = authenticatedUser.uid;
+      const email = authenticatedUser.email;
 
       if (!uid && !email) {
         return res.status(400).json({ error: 'uid or email query param required' });
@@ -770,6 +784,13 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.post('/api/payments/pochi/restore-by-sms', async (req, res) => {
     try {
       const { email, smsText, uid } = req.body;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      if (!authenticatedUser || !authenticatedUser.emailVerified || authenticatedUser.signInProvider !== 'google.com') {
+        return res.status(401).json({ success: false, approved: false, redirectToBuy: false, error: 'Please sign in with your verified Google account to restore access.' });
+      }
+      if (String(email || '').trim().toLowerCase() !== authenticatedUser.email || (uid && uid !== authenticatedUser.uid)) {
+        return res.status(403).json({ success: false, approved: false, redirectToBuy: false, error: 'The account details do not match your signed-in Google account.' });
+      }
 
       if (!email || !smsText) {
         return res.status(400).json({
@@ -831,6 +852,13 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.post('/api/entitlements/check', async (req, res) => {
     try {
       const { email, uid, deviceId, deviceName, platform } = req.body;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      if (!authenticatedUser) {
+        return res.status(401).json({ authorized: false, error: 'Sign in with Google to verify access.' });
+      }
+      if (uid !== authenticatedUser.uid || String(email || '').trim().toLowerCase() !== authenticatedUser.email) {
+        return res.status(403).json({ authorized: false, error: 'The account details do not match your signed-in account.' });
+      }
       if (!email && !uid) {
         return res.status(400).json({ error: 'Email or UID is required' });
       }
