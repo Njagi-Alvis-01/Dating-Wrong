@@ -1351,14 +1351,14 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   });
 
   // Admin: Notification Toggle for Pending Approvals
-  app.get('/api/admin/notifications/toggle', requireAdminAuth, (req, res) => {
+  app.get('/api/admin/notifications/toggle', requireAdminAuth, async (req, res) => {
     res.json({
       success: true,
       pendingApprovalsNotificationsEnabled: await NotificationService.isPendingApprovalsNotificationsEnabled(),
     });
   });
 
-  app.post('/api/admin/notifications/toggle', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/notifications/toggle', requireAdminAuth, async (req, res) => {
     const { enabled } = req.body;
     const newState = await NotificationService.setPendingApprovalsNotificationsEnabled(Boolean(enabled));
     res.json({
