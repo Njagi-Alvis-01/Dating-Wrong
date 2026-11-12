@@ -1300,8 +1300,8 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       success: true,
       pendingApprovalsNotificationsEnabled: newState,
       message: newState
-        ? 'Pending approvals notifications activated! Email & SMS alerts enabled for Mark, Gerishon, and Alvis.'
-        : 'Pending approvals notifications paused. Email & SMS alerts are now muted.',
+        ? 'Pending approval alerts activated. Delivery depends on the email and SMS providers configured for this deployment.'
+        : 'Pending approval alerts are paused for all administrators.',
     });
   });
 
