@@ -305,7 +305,7 @@ Published by Mark & Alvis
 </html>
     `.trim();
 
-    let dispatchStatus: 'SENT' | 'SIMULATED' | 'FAILED' = 'SIMULATED';
+    let dispatchStatus: 'SENT' | 'SIMULATED' | 'FAILED' = process.env.VERCEL === '1' ? 'FAILED' : 'SIMULATED';
     const transporter = this.getTransporter();
     const mailUser = process.env.GMAIL_USER || process.env.SMTP_USER || 'orders@datingwrong.ke';
     const fromAddress = process.env.SMTP_FROM || `"Dating Wrong" <${mailUser}>`;
@@ -338,10 +338,10 @@ Published by Mark & Alvis
       bodyHtml,
     };
 
-    this.emailLogs.unshift(log);
+    await this.recordEmailLog(log);
     console.log(`[Email Rejection] Recorded "${subject}" to ${params.customerEmail} (Reason: ${effectiveReason})`);
 
-    return { success: dispatchStatus !== 'FAILED', log };
+    return { success: dispatchStatus === 'SENT', log };
   }
 
   private static async recordEmailLog(log: EmailLogEntry): Promise<void> {
