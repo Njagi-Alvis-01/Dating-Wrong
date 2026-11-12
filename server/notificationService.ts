@@ -11,7 +11,7 @@
 import { normalizeKenyanPhone } from '../src/utils/phoneNormalization.ts';
 import nodemailer from 'nodemailer';
 import { AccessTicketStore } from './accessTicketStore.ts';
-import { fsGetDoc, fsSetDoc } from './firestoreAdapter.ts';
+import { fsGetDoc, fsSetDoc, fsQuery } from './firestoreAdapter.ts';
 
 export interface AdminContact {
   name: string;
@@ -133,8 +133,26 @@ export class NotificationService {
     return enabled;
   }
 
-  static getRecentLogs() {
-    return this.dispatchLogs;
+  static async getRecentLogs() {
+    try {
+      const docs = await fsQuery<any>('notificationLogs', [], {
+        orderBy: { field: 'timestamp', direction: 'desc' },
+        limit: 100,
+      });
+      return docs.map((item) => item.data);
+    } catch (err: any) {
+      console.warn('[NOTIFICATION LOG READ]', err.message);
+      return this.dispatchLogs;
+    }
+  }
+
+  private static async recordDispatchLog(entry: any): Promise<void> {
+    this.dispatchLogs.unshift(entry);
+    try {
+      await fsSetDoc('notificationLogs', entry.id, entry);
+    } catch (err: any) {
+      console.error('[NOTIFICATION LOG PERSISTENCE ERROR]', err.message);
+    }
   }
 
   /**
@@ -449,7 +467,7 @@ export class NotificationService {
     }
 
     const success = results.length === ADMIN_CONTACTS.length && results.every((item) => item.status === 'sent');
-    this.dispatchLogs.unshift({
+    await this.recordDispatchLog({
       id: `DISPATCH-${Date.now()}`,
       type: 'pochi_review',
       payload,
