@@ -1173,8 +1173,8 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   });
 
   // Section 37: Customer Email Confirmation Logs
-  app.get('/api/admin/email-logs', requireAdminAuth, (req, res) => {
-    res.json({ logs: EmailConfirmationService.getRecentEmailLogs() });
+  app.get('/api/admin/email-logs', requireAdminAuth, async (req, res) => {
+    res.json({ logs: await EmailConfirmationService.getRecentEmailLogs() });
   });
 
   // Section 44: Admin Book Management
