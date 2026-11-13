@@ -407,7 +407,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       return res.status(404).json({ error: 'Sandbox confirmation is disabled in production. Safaricom callbacks are the only payment confirmation source.' });
     }
     try {
-      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
       if (!authenticatedUser) return res.status(401).json({ error: 'Sign in before testing a sandbox payment.' });
       const { checkoutRequestId, customCode } = req.body;
       const payment = checkoutRequestId
@@ -485,7 +485,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.post('/api/payments/pochi/submit-sms', async (req, res) => {
     try {
       const { uid, email, customerName, submittedSms, senderPhone } = req.body;
-      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
 
       if (!authenticatedUser || !authenticatedUser.emailVerified || authenticatedUser.signInProvider !== 'google.com') {
         return res.status(401).json({ success: false, error: 'Please sign in with a verified Google account before submitting your M-PESA confirmation SMS.' });
@@ -657,7 +657,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   // Get user's payment requests
   app.get('/api/payments/pochi/user-requests', async (req, res) => {
     try {
-      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
       if (!authenticatedUser) {
         return res.status(401).json({ success: false, error: 'Sign in to retrieve your payment requests.' });
       }
@@ -686,7 +686,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.post('/api/payments/pochi/restore-by-sms', async (req, res) => {
     try {
       const { email, smsText, uid } = req.body;
-      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
       if (!authenticatedUser || !authenticatedUser.emailVerified || authenticatedUser.signInProvider !== 'google.com') {
         return res.status(401).json({ success: false, approved: false, redirectToBuy: false, error: 'Please sign in with your verified Google account to restore access.' });
       }
@@ -754,7 +754,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.post('/api/entitlements/check', async (req, res) => {
     try {
       const { email, uid, deviceId, deviceName, platform } = req.body;
-      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string } | undefined;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
       if (!authenticatedUser) {
         return res.status(401).json({ authorized: false, error: 'Sign in with Google to verify access.' });
       }
