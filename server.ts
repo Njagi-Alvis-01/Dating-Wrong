@@ -9,11 +9,12 @@ import { EmailConfirmationService } from './server/emailConfirmationService.ts';
 import { AccessTicketStore } from './server/accessTicketStore.ts';
 import { requireAdminAuth, generateAdminSessionToken, ADMIN_ALLOWLIST } from './server/middleware/auth.ts';
 import { adminAuth } from './server/firebaseAdmin.ts';
-import { runWithRequestAuth, isUnauthenticatedPermissionError } from './server/firestoreAdapter.ts';
+import { runWithRequestAuth, isUnauthenticatedPermissionError, fsSetDoc } from './server/firestoreAdapter.ts';
 import { verifyPastedMpesaSms } from './src/utils/mpesaSmsParser.ts';
 import { normalizeKenyanPhone } from './src/utils/phoneNormalization.ts';
 
-async function startServer() {
+export async function createApp(options: { serveFrontend?: boolean } = {}) {
+  const { serveFrontend = true } = options;
   const app = express();
   const portArgIdx = process.argv.indexOf('--port');
   const portFromArgs = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? parseInt(process.argv[portArgIdx + 1], 10) : undefined;
@@ -52,6 +53,12 @@ async function startServer() {
       if (idToken) {
         try {
           const decoded = await adminAuth.verifyIdToken(idToken);
+          (req as any).firebaseUser = {
+            uid: decoded.uid,
+            email: (decoded.email || '').trim().toLowerCase(),
+            emailVerified: decoded.email_verified === true,
+            signInProvider: decoded.firebase?.sign_in_provider || '',
+          };
           return runWithRequestAuth(
             {
               uid: decoded.uid,
@@ -134,37 +141,25 @@ async function startServer() {
   // Requires a genuine ACTIVE Firestore entitlement or verified non-revoked transaction code.
   app.post('/api/book/content', async (req, res) => {
     try {
-      const { transactionCode, uid } = req.body;
-
-      let isEntitled = false;
-
-      if (uid && typeof uid === 'string') {
-        const entitlementRecord = await PaymentStore.getEntitlement(uid.trim(), 'dating-wrong');
-        if (entitlementRecord && entitlementRecord.status === 'ACTIVE') {
-          isEntitled = true;
-        }
+      const authenticatedUser = (req as any).firebaseUser as { uid: string } | undefined;
+      if (!authenticatedUser) {
+        return res.status(401).json({ error: 'Sign in to access the protected reader.' });
+      }
+      if (req.body?.uid && req.body.uid !== authenticatedUser.uid) {
+        return res.status(403).json({ error: 'The requested account does not match your signed-in account.' });
       }
 
-      if (!isEntitled && transactionCode && typeof transactionCode === 'string') {
-        const normalized = PaymentStore.normalizeTransactionCode(transactionCode);
-        if (normalized) {
-          const used = await PaymentStore.getUsedTransaction(normalized);
-          if (used && used.status !== 'REVOKED') {
-            isEntitled = true;
-          }
-        }
-      }
-
-      if (!isEntitled) {
+      const entitlementRecord = await PaymentStore.getEntitlement(authenticatedUser.uid, 'dating-wrong');
+      if (!entitlementRecord || entitlementRecord.status !== 'ACTIVE') {
         return res.status(403).json({
           error: 'Unauthorized access',
-          message: 'A valid entitlement or verified M-PESA purchase is required to read Dating Wrong.',
+          message: 'An active entitlement is required to read Dating Wrong.',
           book: 'Dating Wrong by Gerishon Wanyeki',
-          cta: 'Please complete purchase via M-PESA to unlock the protected reader.',
+          cta: 'Please complete the official purchase and administrator approval process.',
         });
       }
 
-      res.json({
+      return res.json({
         success: true,
         metadata: MANUSCRIPT_V1.metadata,
         sections: MANUSCRIPT_V1.sections,
@@ -172,7 +167,7 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[BOOK CONTENT ERROR]', err.message);
-      res.status(500).json({ error: 'Service temporarily unavailable to verify access.' });
+      return res.status(500).json({ error: 'Service temporarily unavailable to verify access.' });
     }
   });
 
@@ -256,7 +251,11 @@ async function startServer() {
   // Step 1: Backend initiates genuine M-PESA STK Push via Daraja
   app.post('/api/payments/mpesa/initiate', async (req, res) => {
     try {
-      const { phone, amount, name, email, uid } = req.body;
+      const { phone, name } = req.body;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
+      if (!authenticatedUser || !authenticatedUser.emailVerified || authenticatedUser.signInProvider !== 'google.com') {
+        return res.status(401).json({ error: 'A verified Google sign-in is required to initiate payment.' });
+      }
 
       if (!phone) {
         return res.status(400).json({ error: 'Phone number is required for M-PESA payment' });
@@ -270,9 +269,9 @@ async function startServer() {
       }
 
       const config = PaymentStore.getConfig();
-      const expectedAmount = amount || config.priceKes;
-      const userUid = uid || `GUEST_${Date.now()}`;
-      const customerEmail = email || 'reader@datingwrong.ke';
+      const expectedAmount = config.priceKes;
+      const userUid = authenticatedUser.uid;
+      const customerEmail = authenticatedUser.email;
       const customerName = name || 'Valued Reader';
 
       // Call Daraja Service
@@ -323,10 +322,15 @@ async function startServer() {
   app.get('/api/payments/mpesa/status/:checkoutRequestId', async (req, res) => {
     try {
       const { checkoutRequestId } = req.params;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string } | undefined;
+      if (!authenticatedUser) return res.status(401).json({ error: 'Sign in to check your payment.' });
       const payment = await PaymentStore.getPaymentByCheckoutRequestId(checkoutRequestId);
 
       if (!payment) {
         return res.status(404).json({ error: 'Payment request not found' });
+      }
+      if (payment.uid !== authenticatedUser.uid) {
+        return res.status(403).json({ error: 'You are not authorized to view this payment.' });
       }
 
       res.json({
@@ -347,13 +351,17 @@ async function startServer() {
 
   // Step 3: Daraja Webhook Callback (Called directly by Safaricom servers upon PIN authorization)
   app.post('/api/payments/daraja/callback', async (req, res) => {
-    console.log('[Daraja Callback Webhook Received]', JSON.stringify(req.body));
+    console.log('[Daraja Callback Webhook Received]');
     try {
       const parsed = daraja.parseCallback(req.body);
 
       const payment = await PaymentStore.getPaymentByCheckoutRequestId(parsed.checkoutRequestId);
       if (!payment) {
-        console.warn(`[Daraja Callback] No payment session found for CheckoutRequestID ${parsed.checkoutRequestId}`);
+        console.warn('[Daraja Callback] No matching payment session found.');
+        return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+      }
+      if (payment.merchantRequestId && parsed.merchantRequestId !== payment.merchantRequestId) {
+        console.error('[Daraja Callback] MerchantRequestID does not match the stored payment session.');
         return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
       }
 
@@ -362,6 +370,13 @@ async function startServer() {
         payment.status = 'FAILED';
         payment.failureReason = parsed.resultDesc;
         payment.updatedAt = new Date().toISOString();
+        return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+      }
+
+      // Confirm the CheckoutRequestID with Safaricom before granting any entitlement.
+      const safaricomResult = await daraja.verifyStkPush(parsed.checkoutRequestId);
+      if (!safaricomResult.isSuccessful) {
+        console.warn(`[Daraja Callback] Safaricom query did not confirm success: ${safaricomResult.resultDesc}`);
         return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
       }
 
@@ -388,40 +403,38 @@ async function startServer() {
 
   // Step 4: Customer Prompt Confirmation / Sandbox Simulation Endpoint
   app.post('/api/payments/mpesa/confirm-pin-entry', async (req, res) => {
+    if (process.env.MPESA_ENV !== 'sandbox') {
+      return res.status(404).json({ error: 'Sandbox confirmation is disabled in production. Safaricom callbacks are the only payment confirmation source.' });
+    }
     try {
-      const { checkoutRequestId, customCode, uid, name, email, phone, amount } = req.body;
-
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
+      if (!authenticatedUser) return res.status(401).json({ error: 'Sign in before testing a sandbox payment.' });
+      const { checkoutRequestId, customCode } = req.body;
       const payment = checkoutRequestId
         ? await PaymentStore.getPaymentByCheckoutRequestId(checkoutRequestId)
         : null;
+      if (!payment || payment.uid !== authenticatedUser.uid || payment.email !== authenticatedUser.email) {
+        return res.status(403).json({ error: 'A matching payment session for your signed-in account is required.' });
+      }
 
-      const config = PaymentStore.getConfig();
-      const expectedAmount = amount || payment?.expectedAmount || config.priceKes;
-      const targetPhone = phone || payment?.checkoutPhone || '254700000000';
-      const targetUid = uid || payment?.uid || `USR-${Date.now()}`;
-      const targetName = name || payment?.customerName || 'Authorized Reader';
-      const targetEmail = email || payment?.email || 'reader@datingwrong.ke';
-
-      // Generate or use code
+      const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+      const numbers = '0123456789';
       let code = (customCode || '').trim().toUpperCase();
       if (!code) {
-        const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-        const numbers = '0123456789';
         code = 'R';
         for (let i = 0; i < 2; i++) code += letters.charAt(Math.floor(Math.random() * letters.length));
         for (let i = 0; i < 2; i++) code += numbers.charAt(Math.floor(Math.random() * numbers.length));
         for (let i = 0; i < 5; i++) code += (letters + numbers).charAt(Math.floor(Math.random() * (letters.length + numbers.length)));
       }
 
-      // Execute the 9 strict security checks
       const result = await PaymentStore.verifyAndGrantEntitlement({
-        paymentId: payment?.paymentId,
+        paymentId: payment.paymentId,
         checkoutRequestId,
-        uid: targetUid,
-        email: targetEmail,
-        customerName: targetName,
-        senderPhone: targetPhone,
-        amountReceived: expectedAmount,
+        uid: authenticatedUser.uid,
+        email: authenticatedUser.email,
+        customerName: payment.customerName,
+        senderPhone: payment.checkoutPhone,
+        amountReceived: payment.expectedAmount,
         transactionCode: code,
         verificationMethod: 'daraja_stk',
       });
@@ -434,8 +447,7 @@ async function startServer() {
           checksLog: result.checksLog,
         });
       }
-
-      res.json({
+      return res.json({
         success: true,
         status: 'VERIFIED',
         receiptNumber: code,
@@ -443,124 +455,21 @@ async function startServer() {
         checksLog: result.checksLog,
       });
     } catch (err: any) {
-      console.error('Error confirming M-PESA PIN entry:', err.message);
-      res.status(500).json({ error: err.message });
+      console.error('Error confirming M-PESA sandbox payment:', err.message);
+      return res.status(500).json({ error: 'Sandbox payment confirmation failed.' });
     }
   });
 
   // =========================================================================
   // SECTION 16: PLAN B — MANUAL SMS RECEIPT & VERIFICATION
   // =========================================================================
-  app.post('/api/payments/verify-sms-or-receipt', async (req, res) => {
-    try {
-      const { smsText, receiptCode, phone, uid, name, email } = req.body;
-
-      const config = PaymentStore.getConfig();
-      const targetUid = uid || `USR_${Date.now()}`;
-      const targetEmail = email || 'reader@datingwrong.ke';
-      const targetName = name || 'Verified Reader';
-      const checkoutPhone = phone || '254700000000';
-
-      let extractedCode = (receiptCode || '').trim().toUpperCase();
-      let extractedAmount = config.priceKes;
-      let rawReference = smsText || receiptCode;
-
-      // If user provided a pasted SMS text:
-      if (smsText && smsText.trim().length > 15) {
-        const smsVerification = verifyPastedMpesaSms({
-          smsText,
-          expectedAmount: config.priceKes,
-          checkoutPhone,
-          merchantName: config.recipient,
-          paybillNumber: config.paybill,
-        });
-
-        if (!smsVerification.isValid) {
-          if (smsVerification.decision === 'UNDERPAID') {
-            await NotificationService.notifyAllThreeAdmins({
-              customerName: targetName,
-              customerEmail: targetEmail,
-              customerPhone: checkoutPhone,
-              amount: smsVerification.extractedAmount || 0,
-              expectedAmount: config.priceKes,
-              transactionCode: smsVerification.extractedCode || 'UNKNOWN',
-              status: 'UNDERPAID',
-              verificationMethod: 'pasted_sms',
-            });
-          }
-
-          return res.status(400).json({
-            success: false,
-            decision: smsVerification.decision,
-            error: smsVerification.reason || 'SMS verification check failed',
-            checks: smsVerification.checks,
-            parsed: smsVerification.parsed,
-          });
-        }
-
-        extractedCode = smsVerification.extractedCode!;
-        extractedAmount = smsVerification.extractedAmount!;
-      }
-
-      const normalizedCode = PaymentStore.normalizeTransactionCode(extractedCode);
-      if (!normalizedCode || normalizedCode.length < 8) {
-        return res.status(400).json({
-          error: 'Please enter a valid 10-character M-PESA transaction code (e.g. RK72QM9XLP)',
-        });
-      }
-
-      // Check transaction uniqueness before granting
-      const existingUse = await PaymentStore.getUsedTransaction(normalizedCode);
-      if (existingUse) {
-        await NotificationService.notifyAllThreeAdmins({
-          customerName: targetName,
-          customerEmail: targetEmail,
-          customerPhone: checkoutPhone,
-          amount: extractedAmount,
-          expectedAmount: config.priceKes,
-          transactionCode: normalizedCode,
-          status: 'DUPLICATE',
-          verificationMethod: 'pasted_sms',
-        });
-
-        return res.status(409).json({
-          success: false,
-          decision: 'DUPLICATE',
-          error: `Transaction code ${normalizedCode} has already been used to unlock the book for another account. A transaction code can only unlock the book once.`,
-        });
-      }
-
-      // Run through strict backend verification
-      const verifyResult = await PaymentStore.verifyAndGrantEntitlement({
-        uid: targetUid,
-        email: targetEmail,
-        customerName: targetName,
-        senderPhone: checkoutPhone,
-        amountReceived: extractedAmount,
-        transactionCode: normalizedCode,
-        verificationMethod: 'pasted_sms',
-        rawReference,
-      });
-
-      if (!verifyResult.passed) {
-        return res.status(400).json({
-          success: false,
-          decision: verifyResult.status,
-          error: verifyResult.failureReason,
-          checksLog: verifyResult.checksLog,
-        });
-      }
-
-      res.json({
-        success: true,
-        message: 'M-PESA transaction verified. Digital book unlocked.',
-        entitlement: verifyResult.entitlement,
-        checksLog: verifyResult.checksLog,
-      });
-    } catch (err: any) {
-      console.error('Error verifying SMS receipt:', err.message);
-      res.status(500).json({ error: err.message });
-    }
+  // Legacy pasted-SMS endpoint is disabled: customer-provided SMS must never grant access
+  // directly. The supported Pochi flow records the request and requires an administrator review.
+  app.post('/api/payments/verify-sms-or-receipt', (_req, res) => {
+    return res.status(410).json({
+      success: false,
+      error: 'This legacy verification route is retired. Submit the M-PESA SMS through the Pochi payment review flow.',
+    });
   });
 
   // =========================================================================
@@ -576,6 +485,14 @@ async function startServer() {
   app.post('/api/payments/pochi/submit-sms', async (req, res) => {
     try {
       const { uid, email, customerName, submittedSms, senderPhone } = req.body;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
+
+      if (!authenticatedUser || !authenticatedUser.emailVerified || authenticatedUser.signInProvider !== 'google.com') {
+        return res.status(401).json({ success: false, error: 'Please sign in with a verified Google account before submitting your M-PESA confirmation SMS.' });
+      }
+      if (uid !== authenticatedUser.uid || String(email || '').trim().toLowerCase() !== authenticatedUser.email) {
+        return res.status(403).json({ success: false, error: 'The submitted account does not match your verified sign-in session.' });
+      }
 
       if (!uid || !email) {
         return res.status(401).json({
@@ -664,11 +581,22 @@ async function startServer() {
         baseUrl,
       });
 
+      const notificationsDelivered = Boolean(result.notificationResult?.success);
       res.json({
         success: true,
-        message: 'Payment verification request received. Administrators have been notified for review.',
+        message: notificationsDelivered
+          ? 'Payment verification request received and administrator alerts were delivered.'
+          : 'Payment verification request was saved, but administrator alerts could not be confirmed. The request remains available in the admin dashboard.',
         requestId: result.request.requestId,
         status: 'PENDING_REVIEW',
+        notificationsDelivered,
+        notificationResult: result.notificationResult
+          ? {
+              success: result.notificationResult.success,
+              muted: result.notificationResult.muted || false,
+              dispatchedTo: result.notificationResult.dispatchedTo,
+            }
+          : null,
         request: result.request,
         parsedDetails: {
           transactionCode: normalizedCode,
@@ -692,10 +620,18 @@ async function startServer() {
   app.get('/api/payments/pochi/request-status/:requestId', async (req, res) => {
     try {
       const { requestId } = req.params;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string } | undefined;
+      if (!authenticatedUser) {
+        return res.status(401).json({ success: false, error: 'Sign in to check your payment request.' });
+      }
       const request = await PaymentStore.getPaymentRequest(requestId);
 
       if (!request) {
         return res.status(404).json({ success: false, error: 'Payment request not found.' });
+      }
+
+      if (request.uid !== authenticatedUser.uid) {
+        return res.status(403).json({ success: false, error: 'You are not authorized to view this payment request.' });
       }
 
       let entitlement = null;
@@ -721,8 +657,12 @@ async function startServer() {
   // Get user's payment requests
   app.get('/api/payments/pochi/user-requests', async (req, res) => {
     try {
-      const uid = req.query.uid as string;
-      const email = req.query.email as string;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
+      if (!authenticatedUser) {
+        return res.status(401).json({ success: false, error: 'Sign in to retrieve your payment requests.' });
+      }
+      const uid = authenticatedUser.uid;
+      const email = authenticatedUser.email;
 
       if (!uid && !email) {
         return res.status(400).json({ error: 'uid or email query param required' });
@@ -746,6 +686,13 @@ async function startServer() {
   app.post('/api/payments/pochi/restore-by-sms', async (req, res) => {
     try {
       const { email, smsText, uid } = req.body;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
+      if (!authenticatedUser || !authenticatedUser.emailVerified || authenticatedUser.signInProvider !== 'google.com') {
+        return res.status(401).json({ success: false, approved: false, redirectToBuy: false, error: 'Please sign in with your verified Google account to restore access.' });
+      }
+      if (String(email || '').trim().toLowerCase() !== authenticatedUser.email || (uid && uid !== authenticatedUser.uid)) {
+        return res.status(403).json({ success: false, approved: false, redirectToBuy: false, error: 'The account details do not match your signed-in Google account.' });
+      }
 
       if (!email || !smsText) {
         return res.status(400).json({
@@ -807,6 +754,13 @@ async function startServer() {
   app.post('/api/entitlements/check', async (req, res) => {
     try {
       const { email, uid, deviceId, deviceName, platform } = req.body;
+      const authenticatedUser = (req as any).firebaseUser as { uid: string; email: string; emailVerified: boolean; signInProvider: string } | undefined;
+      if (!authenticatedUser) {
+        return res.status(401).json({ authorized: false, error: 'Sign in with Google to verify access.' });
+      }
+      if (uid !== authenticatedUser.uid || String(email || '').trim().toLowerCase() !== authenticatedUser.email) {
+        return res.status(403).json({ authorized: false, error: 'The account details do not match your signed-in account.' });
+      }
       if (!email && !uid) {
         return res.status(400).json({ error: 'Email or UID is required' });
       }
@@ -1225,20 +1179,25 @@ async function startServer() {
   });
 
   // Section 46: SMS Monitoring Logs
-  app.get('/api/admin/sms-logs', requireAdminAuth, (req, res) => {
-    res.json({ logs: NotificationService.getRecentLogs() });
+  app.get('/api/admin/sms-logs', requireAdminAuth, async (req, res) => {
+    res.json({ logs: await NotificationService.getRecentLogs() });
   });
 
   // Section 37: Customer Email Confirmation Logs
-  app.get('/api/admin/email-logs', requireAdminAuth, (req, res) => {
-    res.json({ logs: EmailConfirmationService.getRecentEmailLogs() });
+  app.get('/api/admin/email-logs', requireAdminAuth, async (req, res) => {
+    res.json({ logs: await EmailConfirmationService.getRecentEmailLogs() });
   });
 
   // Section 44: Admin Book Management
-  app.post('/api/admin/book-config', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/book-config', requireAdminAuth, async (req, res) => {
     const { title, subtitle, priceKes, activeVersion, publisher } = req.body;
     if (priceKes) {
       PaymentStore.setConfiguredPrice(Number(priceKes));
+      await fsSetDoc('config', 'book-settings', {
+        bookPriceKes: Number(priceKes),
+        updatedBy: (req as any).adminUser?.email || 'authorized-admin',
+        updatedAt: new Date().toISOString(),
+      }, { merge: true });
     }
     res.json({
       success: true,
@@ -1327,22 +1286,22 @@ async function startServer() {
   });
 
   // Admin: Notification Toggle for Pending Approvals
-  app.get('/api/admin/notifications/toggle', requireAdminAuth, (req, res) => {
+  app.get('/api/admin/notifications/toggle', requireAdminAuth, async (req, res) => {
     res.json({
       success: true,
-      pendingApprovalsNotificationsEnabled: NotificationService.isPendingApprovalsNotificationsEnabled(),
+      pendingApprovalsNotificationsEnabled: await NotificationService.isPendingApprovalsNotificationsEnabled(),
     });
   });
 
-  app.post('/api/admin/notifications/toggle', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/notifications/toggle', requireAdminAuth, async (req, res) => {
     const { enabled } = req.body;
-    const newState = NotificationService.setPendingApprovalsNotificationsEnabled(Boolean(enabled));
+    const newState = await NotificationService.setPendingApprovalsNotificationsEnabled(Boolean(enabled));
     res.json({
       success: true,
       pendingApprovalsNotificationsEnabled: newState,
       message: newState
-        ? 'Pending approvals notifications activated! Email & SMS alerts enabled for Mark, Gerishon, and Alvis.'
-        : 'Pending approvals notifications paused. Email & SMS alerts are now muted.',
+        ? 'Pending approval alerts activated. Delivery depends on the email and SMS providers configured for this deployment.'
+        : 'Pending approval alerts are paused for all administrators.',
     });
   });
 
@@ -1442,7 +1401,7 @@ async function startServer() {
   });
 
   // Admin: Update Pochi la Biashara configuration
-  app.post('/api/admin/config/pochi', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/config/pochi', requireAdminAuth, async (req, res) => {
     const { pochiPhone, pochiName, priceKes, instructions } = req.body;
     PaymentStore.updatePochiConfig({
       pochiPhone,
@@ -1450,6 +1409,7 @@ async function startServer() {
       priceKes: priceKes ? Number(priceKes) : undefined,
       instructions,
     });
+    await fsSetDoc('config', 'pochi-settings', PaymentStore.getPochiConfig(), { merge: true });
     res.json({
       success: true,
       message: 'Pochi la Biashara configuration updated.',
@@ -1479,8 +1439,9 @@ async function startServer() {
     });
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production') {
+  // Frontend hosting is handled by Vercel's static output in production.
+  // Only attach Vite/Express static middleware when running the standalone server.
+  if (serveFrontend && process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -1489,7 +1450,7 @@ async function startServer() {
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (serveFrontend) {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -1497,19 +1458,23 @@ async function startServer() {
     });
   }
 
+  return app;
+}
+
+async function startServer() {
+  const app = await createApp({ serveFrontend: true });
+  const PORT = Number(process.env.PORT) || 3000;
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Dating Wrong platform running on http://0.0.0.0:${PORT}`);
-    console.log(`Daraja M-PESA STK Push gateway initialized for Mark & Alvis Publishers`);
-    console.log(`Admin alert dispatch active for Gerishon Wanyeki, Alvis Njagi, and Mark`);
+    console.log('Daraja M-PESA STK Push gateway initialized for Mark & Alvis Publishers');
+    console.log('Admin alert dispatch active for Gerishon Wanyeki, Alvis Njagi, and Mark');
   });
-
   server.on('error', (err: any) => {
-    if (err.code === 'EADDRINUSE') {
-      console.warn(`[SERVER WARNING] Port ${PORT} already bound or in use by dev supervisor.`);
-    } else {
-      console.error('[SERVER ERROR]', err);
-    }
+    if (err.code === 'EADDRINUSE') console.warn(`[SERVER WARNING] Port ${PORT} already bound or in use by dev supervisor.`);
+    else console.error('[SERVER ERROR]', err);
   });
 }
 
-startServer();
+if (process.env.VERCEL !== '1') {
+  void startServer();
+}
