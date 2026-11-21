@@ -1,6 +1,5 @@
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { MANUSCRIPT_V1 } from './src/data/manuscript-v1.ts';
 import { DarajaService } from './server/darajaService.ts';
 import { PaymentStore } from './server/paymentStore.ts';
@@ -1442,6 +1441,10 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   // Frontend hosting is handled by Vercel's static output in production.
   // Only attach Vite/Express static middleware when running the standalone server.
   if (serveFrontend && process.env.NODE_ENV !== 'production') {
+    // Load Vite only for the standalone development server. Importing Vite
+    // at module scope pulls Rollup's platform-specific optional binaries into
+    // every Vercel API function even though the serverless app never serves UI.
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
