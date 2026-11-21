@@ -21,7 +21,11 @@ export interface AuthenticatedAdminRequest extends Request {
 }
 
 // Server HMAC Secret for signing administrative session nonces
-const ADMIN_HMAC_SECRET = process.env.ADMIN_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const ADMIN_HMAC_SECRET = process.env.ADMIN_SESSION_SECRET || (
+  process.env.VERCEL === '1'
+    ? (() => { throw new Error('ADMIN_SESSION_SECRET must be configured in Vercel so admin sessions remain valid across serverless instances.'); })()
+    : crypto.randomBytes(32).toString('hex')
+);
 
 /**
  * Creates a cryptographically signed admin session token.

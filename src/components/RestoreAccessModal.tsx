@@ -89,8 +89,8 @@ export const RestoreAccessModal: React.FC<RestoreAccessModalProps> = ({
     setErrorMsg(null);
     setRedirectNotice(null);
 
-    if (!activeEmail || !activeEmail.includes('@')) {
-      setErrorMsg('Please enter or sign in with your Google account email.');
+    if (!currentUser || !currentUser.email || currentUser.email.trim().toLowerCase() !== activeEmail) {
+      setErrorMsg('Please sign in with the Google account that originally purchased Dating Wrong before restoring access.');
       return;
     }
 

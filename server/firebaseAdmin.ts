@@ -35,9 +35,23 @@ function buildAdminCredential() {
   return undefined;
 }
 
+// Vercel has no Google Application Default Credentials by default.
+// Refuse to start with a partially privileged Firebase client: payment review,
+// entitlements, admin tickets and reader access require Firebase Admin privileges.
+const hasExplicitAdminCredentials = Boolean(
+  process.env.FIREBASE_SERVICE_ACCOUNT_KEY ||
+  (process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY)
+);
+
 // Guarded singleton initialization for serverless execution
 let adminApp: App;
 const explicitCredential = buildAdminCredential();
+
+if (process.env.VERCEL === '1' && !hasExplicitAdminCredentials) {
+  throw new Error(
+    'Firebase Admin credentials are missing. Configure FIREBASE_SERVICE_ACCOUNT_KEY (recommended) or FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY in Vercel.'
+  );
+}
 
 if (getApps().length === 0) {
   adminApp = initializeApp(

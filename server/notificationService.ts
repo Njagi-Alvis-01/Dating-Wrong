@@ -11,6 +11,7 @@
 import { normalizeKenyanPhone } from '../src/utils/phoneNormalization.ts';
 import nodemailer from 'nodemailer';
 import { AccessTicketStore } from './accessTicketStore.ts';
+import { fsGetDoc, fsSetDoc, fsQuery } from './firestoreAdapter.ts';
 
 export interface AdminContact {
   name: string;
@@ -74,7 +75,9 @@ export interface PurchaseNotificationPayload {
 export interface SmsDispatchResult {
   recipient: string;
   phone: string;
-  status: 'sent' | 'queued' | 'simulated';
+  status: 'sent' | 'queued' | 'simulated' | 'failed' | 'not_configured';
+  emailStatus?: 'sent' | 'failed' | 'not_configured';
+  smsStatus?: 'sent' | 'failed' | 'not_configured';
   messageId: string;
   timestamp: string;
 }
@@ -107,17 +110,49 @@ export class NotificationService {
 
   private static pendingApprovalsNotificationsEnabled = true;
 
-  static isPendingApprovalsNotificationsEnabled(): boolean {
+  static async isPendingApprovalsNotificationsEnabled(): Promise<boolean> {
+    try {
+      const snap = await fsGetDoc<any>('config', 'admin-notifications');
+      const persisted = snap.data?.pendingApprovalsNotificationsEnabled ?? snap.data?.enabled;
+      if (typeof persisted === 'boolean') {
+        this.pendingApprovalsNotificationsEnabled = persisted;
+      }
+    } catch (err: any) {
+      console.warn('[NOTIFICATION SETTINGS READ]', err.message);
+    }
     return this.pendingApprovalsNotificationsEnabled;
   }
 
-  static setPendingApprovalsNotificationsEnabled(enabled: boolean): boolean {
+  static async setPendingApprovalsNotificationsEnabled(enabled: boolean): Promise<boolean> {
+    await fsSetDoc('config', 'admin-notifications', {
+      enabled,
+      pendingApprovalsNotificationsEnabled: enabled,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
     this.pendingApprovalsNotificationsEnabled = enabled;
-    return this.pendingApprovalsNotificationsEnabled;
+    return enabled;
   }
 
-  static getRecentLogs() {
-    return this.dispatchLogs;
+  static async getRecentLogs() {
+    try {
+      const docs = await fsQuery<any>('notificationLogs', [], {
+        orderBy: { field: 'timestamp', direction: 'desc' },
+        limit: 100,
+      });
+      return docs.map((item) => item.data);
+    } catch (err: any) {
+      console.warn('[NOTIFICATION LOG READ]', err.message);
+      return this.dispatchLogs;
+    }
+  }
+
+  private static async recordDispatchLog(entry: any): Promise<void> {
+    this.dispatchLogs.unshift(entry);
+    try {
+      await fsSetDoc('notificationLogs', entry.id, entry);
+    } catch (err: any) {
+      console.error('[NOTIFICATION LOG PERSISTENCE ERROR]', err.message);
+    }
   }
 
   /**
@@ -298,10 +333,9 @@ export class NotificationService {
     dispatchedTo: SmsDispatchResult[];
     muted?: boolean;
   }> {
-    if (!this.pendingApprovalsNotificationsEnabled) {
-      console.log('\n[NOTIFICATIONS MUTED] Pending approvals notification toggle is currently OFF. Alert suppressed.');
+    if (!(await this.isPendingApprovalsNotificationsEnabled())) {
       return {
-        success: true,
+        success: false,
         muted: true,
         smsBody: 'Muted by admin toggle',
         emailBody: 'Muted by admin toggle',
@@ -309,109 +343,148 @@ export class NotificationService {
       };
     }
 
-    const { smsText, emailText, emailHtml, dashboardUrl, firestoreUrl } = this.formatPochiReviewAlert(payload);
-    const results: SmsDispatchResult[] = [];
-
-    console.log('\n=============================================================');
-    console.log('🚨 DATING WRONG — POCHI PAYMENT VERIFICATION ALERT (3 ADMINS)');
-    console.log('Recipient Admins: Mark, Gerishon, Alvis');
-    console.log(`Admin Dashboard Link: ${dashboardUrl}`);
-    console.log(`Firestore Console Link: ${firestoreUrl}`);
-    console.log('=============================================================');
-    console.log(emailText);
-    console.log('=============================================================\n');
-
-    // Configure nodemailer transport (supports Gmail & custom SMTP)
-    let transporter: any = null;
     const gmailUser = process.env.GMAIL_USER || process.env.SMTP_USER;
     const gmailPass = process.env.GMAIL_PASS || process.env.SMTP_PASS;
+    const smtpHost = process.env.SMTP_HOST;
+    let transporter: any = null;
 
-    if (gmailUser && gmailPass) {
-      try {
-        transporter = nodemailer.createTransport({
-          service: 'gmail',
-          auth: {
-            user: gmailUser,
-            pass: gmailPass,
-          },
-        });
-      } catch (transporterErr) {
-        console.warn('[Gmail Transporter Warning]', transporterErr);
-      }
-    } else if (process.env.SMTP_HOST && process.env.SMTP_USER) {
-      try {
-        transporter = nodemailer.createTransport({
-          host: process.env.SMTP_HOST,
-          port: parseInt(process.env.SMTP_PORT || '587', 10),
-          secure: process.env.SMTP_PORT === '465',
-          auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASS,
-          },
-        });
-      } catch (transporterErr) {
-        console.warn('[Nodemailer Transporter Warning]', transporterErr);
-      }
+    if (process.env.SMTP_USER && process.env.SMTP_PASS && smtpHost) {
+      transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: parseInt(process.env.SMTP_PORT || '587', 10),
+        secure: process.env.SMTP_PORT === '465',
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+    } else if (process.env.GMAIL_USER && process.env.GMAIL_PASS) {
+      transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASS },
+      });
     }
 
-    const mailUser = gmailUser || 'alerts@datingwrong.ke';
-    const fromAddress = process.env.SMTP_FROM || `"Dating Wrong" <${mailUser}>`;
+    const atUsername = process.env.AT_USERNAME;
+    const atApiKey = process.env.AT_API_KEY;
+    const smsConfigured = Boolean(atUsername && atApiKey);
+    const results: SmsDispatchResult[] = [];
+    const mailFrom = process.env.SMTP_FROM || `"Dating Wrong" <${gmailUser || 'no-reply@datingwrong.online'}>`;
 
-    for (const admin of ADMIN_CONTACTS) {
+    if (!transporter && !smsConfigured) {
+      return {
+        success: false,
+        smsBody: 'SMS provider not configured',
+        emailBody: 'SMTP provider not configured',
+        dispatchedTo: ADMIN_CONTACTS.map((admin) => ({
+          recipient: `${admin.name} <${admin.email}>`,
+          phone: normalizeKenyanPhone(admin.phone).displayLocal || admin.phone,
+          status: 'not_configured' as const,
+          emailStatus: 'not_configured' as const,
+          smsStatus: 'not_configured' as const,
+          messageId: `NOT-CONFIGURED-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+        })),
+      };
+    }
+
+    // Create all three unique admin review tickets before sending any alert.
+    // A ticket-generation failure must not result in a misleading "sent" record.
+    const tickets = await Promise.all(
+      ADMIN_CONTACTS.map((admin) =>
+        AccessTicketStore.createAdminReviewTicket({
+          adminEmail: admin.email,
+          requestId: payload.requestId,
+        })
+      )
+    );
+
+    for (let index = 0; index < ADMIN_CONTACTS.length; index += 1) {
+      const admin = ADMIN_CONTACTS[index];
+      const ticketId = tickets[index];
       const normalized = normalizeKenyanPhone(admin.phone);
-      const messageId = `POCHI-ALERT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-
-      // Generate a cryptographic, single-use OTP ticket mapped strictly to this administrator
-      const ticketId = await AccessTicketStore.createAdminReviewTicket({
-        adminEmail: admin.email,
-        requestId: payload.requestId,
-      });
-
       const personalized = this.formatPochiReviewAlert(payload, admin, ticketId);
+      let emailStatus: 'sent' | 'failed' | 'not_configured' = 'not_configured';
+      let smsStatus: 'sent' | 'failed' | 'not_configured' = 'not_configured';
+      const messageId = `POCHI-ALERT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 
       if (transporter) {
         try {
           await transporter.sendMail({
-            from: fromAddress,
+            from: mailFrom,
             to: admin.email,
             subject: `[ACTION REQUIRED] New Pochi Payment Review: ${payload.transactionCode} (KSh ${payload.amount})`,
             text: personalized.emailText,
             html: personalized.emailHtml,
           });
-          console.log(`[Nodemailer Dispatch] Real email delivered to ${admin.name} (${admin.email}) with secure OTP token`);
+          emailStatus = 'sent';
+          console.log(`[EMAIL DELIVERED] ${admin.name} <${admin.email}>`);
         } catch (mailErr: any) {
-          console.warn(`[Nodemailer Delivery Error to ${admin.email}]`, mailErr.message);
+          emailStatus = 'failed';
+          console.error(`[EMAIL DELIVERY FAILED] ${admin.email}: ${mailErr.message}`);
         }
       }
 
+      if (smsConfigured) {
+        try {
+          const form = new URLSearchParams({
+            username: atUsername!,
+            to: normalized.canonical || admin.phone,
+            message: personalized.smsText,
+          });
+          if (process.env.AT_SENDER_ID) form.set('from', process.env.AT_SENDER_ID);
+          const smsResponse = await fetch('https://api.africastalking.com/version1/messaging', {
+            method: 'POST',
+            headers: {
+              apiKey: atApiKey!,
+              Accept: 'application/json',
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: form.toString(),
+          });
+          const smsBody = await smsResponse.text();
+          if (!smsResponse.ok) throw new Error(`Africa's Talking returned HTTP ${smsResponse.status}: ${smsBody.slice(0, 300)}`);
+          const parsedSmsResponse = JSON.parse(smsBody);
+          const recipientResult = parsedSmsResponse?.SMSMessageData?.Recipients?.[0];
+          if (!recipientResult || Number(recipientResult.statusCode) >= 400) {
+            throw new Error(recipientResult?.status || 'Africa\'s Talking did not confirm SMS acceptance.');
+          }
+          smsStatus = 'sent';
+          console.log(`[SMS ACCEPTED BY PROVIDER] ${admin.name} <${normalized.displayLocal || admin.phone}>: ${recipientResult.status || recipientResult.statusCode}`);
+        } catch (smsErr: any) {
+          smsStatus = 'failed';
+          console.error(`[SMS DELIVERY FAILED] ${admin.name}: ${smsErr.message}`);
+        }
+      }
+
+      const delivered = emailStatus === 'sent' || smsStatus === 'sent';
       results.push({
         recipient: `${admin.name} (${admin.role}) <${admin.email}>`,
         phone: normalized.displayLocal || admin.phone,
-        status: 'sent',
+        status: delivered ? 'sent' : (transporter || smsConfigured ? 'failed' : 'not_configured'),
+        emailStatus,
+        smsStatus,
         messageId,
         timestamp: new Date().toISOString(),
       });
-
-      console.log(`[Alert Dispatched] SMS & Email sent to ${admin.name} (${admin.email} / ${normalized.displayLocal || admin.phone}) with secure token ${ticketId.slice(0, 8)}...`);
     }
 
-    this.dispatchLogs.unshift({
+    const success = results.length === ADMIN_CONTACTS.length && results.every((item) => item.status === 'sent');
+    await this.recordDispatchLog({
       id: `DISPATCH-${Date.now()}`,
       type: 'pochi_review',
       payload,
-      smsBody: smsText,
-      emailBody: emailText,
+      smsBody: results.map((item) => `${item.recipient}: ${item.smsStatus || 'not_configured'}`).join('\\n'),
+      emailBody: results.map((item) => `${item.recipient}: ${item.emailStatus || 'not_configured'}`).join('\\n'),
       recipients: results,
       timestamp: new Date().toISOString(),
     });
 
     return {
-      success: true,
-      smsBody: smsText,
-      emailBody: emailText,
+      success,
+      smsBody: results.map((item) => `${item.recipient}: ${item.smsStatus}`).join('\\n'),
+      emailBody: results.map((item) => `${item.recipient}: ${item.emailStatus}`).join('\\n'),
       dispatchedTo: results,
     };
   }
+
   /**
    * Format the standardized SMS text body according to specification
    */
