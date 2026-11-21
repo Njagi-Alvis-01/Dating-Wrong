@@ -1,1 +1,1 @@
-export { default } from '../../../vercel-api-runtime.cjs';
+export { default } from '../../../vercel-api-runtime.mjs';
